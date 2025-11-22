@@ -1,0 +1,6 @@
+/target
+.DS_Store
+meilisearch
+cache_db
+data.ms
+dumps
