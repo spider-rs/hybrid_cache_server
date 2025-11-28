@@ -1,0 +1,83 @@
+# ---------- builder ----------
+FROM rust:1.84-bookworm AS builder
+
+WORKDIR /app
+
+# System deps for rocksdb-sys + general Rust builds
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config clang cmake git \
+    libssl-dev ca-certificates curl \
+    librocksdb-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# Build deps layer cache
+COPY Cargo.toml Cargo.lock ./
+
+# Dummy build to cache deps (works best if single-crate; for workspace you may need extra COPY)
+RUN mkdir -p src && echo "fn main(){}" > src/main.rs && cargo build --release && rm -rf src
+
+# Now copy full source and build
+COPY . .
+RUN cargo build --release
+
+# ---------- runtime ----------
+FROM ubuntu:24.04 AS runtime
+
+WORKDIR /app
+
+# Runtime deps:
+# - ca-certificates for https
+# - rocksdb runtime libs (safest: install librocksdb-dev; if you want slimmer, swap to librocksdb* matching your Ubuntu)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    librocksdb-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# --- OPTIONAL: install meilisearch binary (works on Ubuntu) ---
+# If you DON'T want meili inside this container, set START_MEILI=0 at runtime.
+RUN curl -L https://install.meilisearch.com | sh \
+  && mv ./meilisearch /usr/local/bin/meilisearch
+
+# Adjust if your binary name differs:
+# (the output name is typically your crate package name)
+ARG BIN_NAME=hybrid_cache_server
+COPY --from=builder /app/target/release/${BIN_NAME} /usr/local/bin/${BIN_NAME}
+
+# Persist both databases if you want
+VOLUME ["/data/rocksdb", "/data/meili"]
+
+ENV CACHE_PORT=8080
+ENV MEILI_HOST=http://127.0.0.1:7700
+ENV MEILI_MASTER_KEY=masterKey
+ENV MEILI_INDEX=hybrid_cache
+ENV ROCKSDB_PATH=/data/rocksdb
+ENV MEILI_DB_PATH=/data/meili
+
+# Start Meilisearch + your server. Disable meili with START_MEILI=0.
+ENV START_MEILI=1
+
+RUN bash -lc 'cat > /usr/local/bin/entrypoint.sh << "EOF"\n\
+#!/usr/bin/env bash\n\
+set -euo pipefail\n\
+\n\
+BIN=\"'${BIN_NAME}'\"\n\
+\n\
+if [[ \"${START_MEILI:-1}\" != \"0\" ]]; then\n\
+  mkdir -p \"${MEILI_DB_PATH}\"\n\
+  # Run meili in background\n\
+  /usr/local/bin/meilisearch \\\n\
+    --db-path \"${MEILI_DB_PATH}\" \\\n\
+    --http-addr \"0.0.0.0:7700\" \\\n\
+    --master-key \"${MEILI_MASTER_KEY}\" \\\n\
+    --env \"production\" \\\n\
+    --no-analytics &\n\
+fi\n\
+\n\
+mkdir -p \"${ROCKSDB_PATH}\"\n\
+# If your program currently hardcodes \"cache_db\", consider switching to env ROCKSDB_PATH.\n\
+exec /usr/local/bin/${BIN} \n\
+EOF\n\
+chmod +x /usr/local/bin/entrypoint.sh'
+
+EXPOSE 8080 7700
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

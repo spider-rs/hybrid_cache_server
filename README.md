@@ -91,3 +91,9 @@ Index a **single resource** (one HTTP response).
 }
 ```
 
+## Docker
+
+```
+docker build -f docker/Dockerfile.ubuntu -t hybrid-cache:ubuntu --build-arg BIN_NAME=hybrid_cache_server .
+docker run -p 8080:8080 -p 7700:7700 -e MEILI_MASTER_KEY=masterKey hybrid-cache:ubuntu
+```

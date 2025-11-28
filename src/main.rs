@@ -19,11 +19,103 @@ use hyper_util::{
 use meilisearch_sdk::client::Client as MeiliClient;
 use rocksdb::{Direction, IteratorMode, DB};
 use serde::{Deserialize, Serialize};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RocksDbSize {
+    pub estimate_live_data_size_bytes: Option<u64>,
+    pub total_sst_files_size_bytes: Option<u64>,
+    pub live_sst_files_size_bytes: Option<u64>,
+    pub estimate_num_keys: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemCacheSize {
+    pub entries: usize,
+    pub body_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheSizeReport {
+    pub rocksdb: RocksDbSize,
+    pub rocksdb_dir_bytes: u64,
+    pub mem_cache: MemCacheSize,
+}
+
+/// Fast: ask RocksDB for estimates (doesn't scan disk).
+pub fn rocksdb_size(db: &DB) -> RocksDbSize {
+    fn prop(db: &DB, name: &str) -> Option<u64> {
+        db.property_int_value(name).ok().flatten()
+    }
+
+    RocksDbSize {
+        estimate_live_data_size_bytes: prop(db, "rocksdb.estimate-live-data-size"),
+        total_sst_files_size_bytes: prop(db, "rocksdb.total-sst-files-size"),
+        live_sst_files_size_bytes: prop(db, "rocksdb.live-sst-files-size"),
+        estimate_num_keys: prop(db, "rocksdb.estimate-num-keys"),
+    }
+}
+
+/// Exact-ish: scans the RocksDB directory and sums file sizes.
+/// Skips symlinks and uses an explicit stack (no recursion).
+pub fn dir_size_bytes(root: impl AsRef<Path>) -> io::Result<u64> {
+    let root = root.as_ref();
+    let mut total: u64 = 0;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(p) = stack.pop() {
+        let md = fs::symlink_metadata(&p)?;
+        let ft = md.file_type();
+
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            for entry in fs::read_dir(&p)? {
+                stack.push(entry?.path());
+            }
+        } else if ft.is_file() {
+            total = total.saturating_add(md.len());
+        }
+    }
+
+    Ok(total)
+}
+
+/// Sums in-memory cached bodies.
+fn mem_cache_size(state: &AppState) -> MemCacheSize {
+    let mut body_bytes: u64 = 0;
+    let entries = state.mem_resources.len();
+
+    for item in state.mem_resources.iter() {
+        body_bytes = body_bytes.saturating_add(item.value().body.len() as u64);
+    }
+
+    MemCacheSize {
+        entries,
+        body_bytes,
+    }
+}
+
+/// Full report.
+fn cache_size_report(
+    state: &AppState,
+    rocksdb_dir: impl AsRef<Path>,
+) -> io::Result<CacheSizeReport> {
+    Ok(CacheSizeReport {
+        rocksdb: rocksdb_size(&state.db),
+        rocksdb_dir_bytes: dir_size_bytes(rocksdb_dir)?,
+        mem_cache: mem_cache_size(state),
+    })
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -46,6 +138,9 @@ struct ResourceEntry {
     response_headers: HashMap<String, String>,
     /// ID of the file payload stored separately, deduped by content.
     file_id: String,
+    #[serde(default)]
+    /// The resource entry.
+    http_version: HttpVersion,
     /// When this resource was cached (unix timestamp, seconds).
     #[serde(default)]
     created_at: Option<i64>,
@@ -65,6 +160,23 @@ struct ResourceWithBody {
     body: Vec<u8>,
 }
 
+/// Represents an HTTP version
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum HttpVersion {
+    /// HTTP Version 0.9
+    Http09,
+    /// HTTP Version 1.0
+    Http10,
+    #[default]
+    /// HTTP Version 1.1
+    Http11,
+    /// HTTP Version 2.0
+    H2,
+    /// HTTP Version 3.0
+    H3,
+}
+
 /// Shape your HTTP API uses over the wire.
 ///
 /// - `website_key` – which website this belongs to
@@ -79,7 +191,6 @@ struct CachedEntryPayload {
     /// Website-level key (optional in payload; we can also accept header or derive from URL).
     #[serde(default)]
     website_key: Option<String>,
-    /// Unique per-resource cache key (matches your `cache_key` from put_hybrid_cache).
     resource_key: String,
     url: String,
     method: String,
@@ -88,6 +199,8 @@ struct CachedEntryPayload {
     response_headers: HashMap<String, String>,
     /// HTTP response body as base64-encoded bytes.
     body_base64: String,
+    #[serde(default)]
+    http_version: HttpVersion,
 }
 
 /// Minimal document indexed in Meilisearch for search/lookup.
@@ -197,6 +310,8 @@ async fn handle(
         }
         // GET /cache/site/{website_key}
         ("GET", ["cache", "site", website_key]) => handle_site_lookup(website_key, state).await,
+        // GET /cache/size
+        ("GET", ["cache", "size"]) => handle_cache_size(state).await,
         _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
     }
 }
@@ -217,7 +332,7 @@ async fn handle_put_index(
         }
     };
 
-    let payload: CachedEntryPayload = match serde_json::from_slice(&whole_body) {
+    let payload: Box<CachedEntryPayload> = match serde_json::from_slice(&whole_body) {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to parse JSON payload: {e}");
@@ -260,7 +375,7 @@ async fn handle_put_index_batch(
         }
     };
 
-    let payloads: Vec<CachedEntryPayload> = match serde_json::from_slice(&whole_body) {
+    let payloads: Vec<Box<CachedEntryPayload>> = match serde_json::from_slice(&whole_body) {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to parse batch JSON payload: {e}");
@@ -445,7 +560,7 @@ async fn handle_site_lookup(
 /// - add site index entry for fast per-website lookups
 /// - index in Meilisearch
 async fn index_single_entry(
-    payload: CachedEntryPayload,
+    payload: Box<CachedEntryPayload>,
     header_site_key: Option<String>,
     state: Arc<AppState>,
 ) -> Result<(), String> {
@@ -476,6 +591,7 @@ async fn index_single_entry(
         request_headers: payload.request_headers.clone(),
         response_headers: payload.response_headers.clone(),
         file_id: file_id.clone(),
+        http_version: payload.http_version,
         created_at: Some(now_unix_timestamp()),
     };
 
@@ -616,6 +732,7 @@ fn resource_with_body_to_payload(res: &ResourceWithBody) -> CachedEntryPayload {
         status: res.resource.status,
         request_headers: res.resource.request_headers.clone(),
         response_headers: res.resource.response_headers.clone(),
+        http_version: res.resource.http_version,
         body_base64: general_purpose::STANDARD.encode(&res.body),
     }
 }
@@ -759,6 +876,22 @@ fn do_rocksdb_cleanup(
     Ok((expired_resource_keys, orphaned_file_ids))
 }
 
+async fn handle_cache_size(state: Arc<AppState>) -> Result<Response<ResponseBody>, hyper::Error> {
+    let report = match cache_size_report(&state, "cache_db") {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to compute cache size: {e}");
+            return Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Cache size error",
+            ));
+        }
+    };
+
+    let json = serde_json::to_vec(&report).unwrap_or_else(|_| b"{}".to_vec());
+    Ok(json_response(StatusCode::OK, json))
+}
+
 /// A cleanup worker script
 async fn run_cleanup_worker(state: Arc<AppState>) {
     loop {
@@ -844,7 +977,7 @@ mod tests {
             "application/javascript".to_string(),
         );
 
-        let payload = CachedEntryPayload {
+        let payload = Box::new(CachedEntryPayload {
             website_key: Some("example.com".to_string()),
             resource_key: "GET::https://example.com/script.js".to_string(),
             url: "https://example.com/script.js".to_string(),
@@ -853,7 +986,8 @@ mod tests {
             request_headers: HashMap::new(),
             response_headers: resp_headers,
             body_base64: general_purpose::STANDARD.encode(body_bytes),
-        };
+            http_version: HttpVersion::Http11,
+        });
 
         index_single_entry(payload, None, state.clone())
             .await
@@ -881,7 +1015,7 @@ mod tests {
 
         let body_bytes = b"/* shared body across sites */";
 
-        let payload1 = CachedEntryPayload {
+        let payload1 = Box::new(CachedEntryPayload {
             website_key: Some("example.com".to_string()),
             resource_key: "GET::https://example.com/shared.js".to_string(),
             url: "https://example.com/shared.js".to_string(),
@@ -890,9 +1024,10 @@ mod tests {
             request_headers: HashMap::new(),
             response_headers: HashMap::new(),
             body_base64: general_purpose::STANDARD.encode(body_bytes),
-        };
+            http_version: HttpVersion::Http11,
+        });
 
-        let payload2 = CachedEntryPayload {
+        let payload2 = Box::new(CachedEntryPayload {
             website_key: Some("other.com".to_string()),
             resource_key: "GET::https://cdn.example.com/shared.js".to_string(),
             url: "https://cdn.example.com/shared.js".to_string(),
@@ -901,7 +1036,8 @@ mod tests {
             request_headers: HashMap::new(),
             response_headers: HashMap::new(),
             body_base64: general_purpose::STANDARD.encode(body_bytes),
-        };
+            http_version: HttpVersion::Http11,
+        });
 
         index_single_entry(payload1, None, state.clone())
             .await
