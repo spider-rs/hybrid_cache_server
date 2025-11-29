@@ -18,6 +18,13 @@ You send it HTTP responses (with your own `resource_key` / `website_key`) and it
 
 ---
 
+## Quick start
+
+Make sure to have Rust. Rocksdb, and Meilisearch installed.
+
+1. `cargo install hybrid_cache_server`
+2. `./start.sh`
+
 ## Data Model
 
 ### Keys
@@ -33,9 +40,9 @@ You send it HTTP responses (with your own `resource_key` / `website_key`) and it
   A *unique cache key per resource* (you generate this on the producer side, typically from your `put_hybrid_cache` logic).
 
   Examples:
-  - `GET::https://example.com/`
-  - `GET::https://example.com/style.css`
-  - `GET::https://cdn.example.com/jquery.js::Accept:text/javascript`
+  - `GET:https://example.com/`
+  - `GET:https://example.com/style.css`
+  - `GET:https://cdn.example.com/jquery.js::Accept:text/javascript`
 
   Whatever you use here must match the key you pass to `put_hybrid_cache(cache_key, ...)`.
 
@@ -77,7 +84,7 @@ Index a **single resource** (one HTTP response).
 ```jsonc
 {
   "website_key": "example.com",          // optional; can come from header or derived from URL
-  "resource_key": "GET::https://example.com/style.css",
+  "resource_key": "GET:https://example.com/style.css",
   "url": "https://example.com/style.css",
   "method": "GET",
   "status": 200,

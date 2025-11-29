@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    fs, io,
     net::SocketAddr,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,12 +21,8 @@ use hyper_util::{
 use meilisearch_sdk::client::Client as MeiliClient;
 use rocksdb::{Direction, IteratorMode, DB};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
-use tokio::net::TcpListener;
-use tracing::{error, info};
+use tokio::{net::TcpListener, sync::mpsc};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
@@ -124,6 +122,8 @@ struct AppState {
     index_name: String,
     /// In-memory resource cache keyed by resource_key for fast lookups.
     mem_resources: Arc<DashMap<String, ResourceWithBody>>,
+    /// Meili indexing queue (batched by a background worker). None disables Meili indexing.
+    meili_tx: Option<mpsc::Sender<CacheIndexDoc>>,
 }
 
 /// Resource metadata, without the actual body.
@@ -139,7 +139,6 @@ struct ResourceEntry {
     /// ID of the file payload stored separately, deduped by content.
     file_id: String,
     #[serde(default)]
-    /// The resource entry.
     http_version: HttpVersion,
     /// When this resource was cached (unix timestamp, seconds).
     #[serde(default)]
@@ -164,31 +163,17 @@ struct ResourceWithBody {
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HttpVersion {
-    /// HTTP Version 0.9
     Http09,
-    /// HTTP Version 1.0
     Http10,
     #[default]
-    /// HTTP Version 1.1
     Http11,
-    /// HTTP Version 2.0
     H2,
-    /// HTTP Version 3.0
     H3,
 }
 
 /// Shape your HTTP API uses over the wire.
-///
-/// - `website_key` – which website this belongs to
-///   - can also come from the `X-Cache-Site` header
-///   - example: `"example.com"` or `"https://example.com"`
-/// - `resource_key` – your unique cache key per resource (from put_hybrid_cache)
-///   - example:
-///       "GET:https://example.com/style.css"
-///       "GET:https://cdn.example.com/jquery.js::Accept:text/javascript"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedEntryPayload {
-    /// Website-level key (optional in payload; we can also accept header or derive from URL).
     #[serde(default)]
     website_key: Option<String>,
     resource_key: String,
@@ -197,16 +182,16 @@ struct CachedEntryPayload {
     status: u16,
     request_headers: HashMap<String, String>,
     response_headers: HashMap<String, String>,
-    /// HTTP response body as base64-encoded bytes.
     body_base64: String,
     #[serde(default)]
     http_version: HttpVersion,
 }
 
 /// Minimal document indexed in Meilisearch for search/lookup.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheIndexDoc {
-    doc_id: String,    
+    /// Safe Meili primary key (only [0-9a-f] here), derived from resource_key.
+    doc_id: String,
     website_key: String,
     resource_key: String,
     url: String,
@@ -216,7 +201,114 @@ struct CacheIndexDoc {
 
 fn meili_doc_id(resource_key: &str) -> String {
     let h = blake3::hash(resource_key.as_bytes());
-    hex::encode(h.as_bytes()) // only [0-9a-f]
+    hex::encode(h.as_bytes())
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(default)
+}
+
+fn enqueue_meili_doc(state: &AppState, doc: CacheIndexDoc) {
+    let Some(tx) = &state.meili_tx else {
+        return;
+    };
+
+    match tx.try_send(doc) {
+        Ok(_) => {}
+        Err(mpsc::error::TrySendError::Full(doc)) => {
+            // best-effort: don't block request path
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(doc).await;
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(_doc)) => {
+            warn!("meili queue is closed; skipping indexing");
+        }
+    }
+}
+
+async fn flush_meili_buf(
+    index: &meilisearch_sdk::indexes::Index,
+    buf: &mut HashMap<String, CacheIndexDoc>,
+    max_batch: usize,
+) {
+    // Drain in chunks of <= max_batch without borrowing across await.
+    while !buf.is_empty() {
+        let keys: Vec<String> = buf.keys().take(max_batch).cloned().collect();
+        if keys.is_empty() {
+            break;
+        }
+
+        let mut docs = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(doc) = buf.remove(&k) {
+                docs.push(doc);
+            }
+        }
+
+        if docs.is_empty() {
+            break;
+        }
+
+        if let Err(e) = index.add_documents(&docs, Some("doc_id")).await {
+            error!(
+                "meili add_documents batch failed ({} docs): {}",
+                docs.len(),
+                e
+            );
+        }
+    }
+}
+
+async fn meili_indexer_worker(
+    mut rx: mpsc::Receiver<CacheIndexDoc>,
+    client: MeiliClient,
+    index_name: String,
+    flush_every: Duration,
+    max_batch: usize,
+) {
+    let index = client.index(&index_name);
+
+    // Keep only latest doc per doc_id.
+    let mut buf: HashMap<String, CacheIndexDoc> = HashMap::new();
+
+    let mut tick = tokio::time::interval(flush_every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                flush_meili_buf(&index, &mut buf, max_batch).await;
+            }
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(doc) => {
+                        buf.insert(doc.doc_id.clone(), doc);
+
+                        if buf.len() >= max_batch {
+                            flush_meili_buf(&index, &mut buf, max_batch).await;
+                        }
+                    }
+                    None => {
+                        // channel closed
+                        flush_meili_buf(&index, &mut buf, max_batch).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -235,7 +327,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = std::env::var("CACHE_PORT")
         .unwrap_or_else(|_| "8080".into())
         .parse::<u16>()
-        .unwrap_or_default();
+        .unwrap_or(8080);
+
+    let meili_disabled = env_bool("MEILI_DISABLE", false);
+    let meili_queue_cap = env_u64("MEILI_QUEUE_CAP", 50_000) as usize;
+    let meili_batch_max = env_u64("MEILI_BATCH_MAX", 256).max(1) as usize;
+    let meili_flush_ms = env_u64("MEILI_FLUSH_MS", 200).max(10);
 
     let meili_client = MeiliClient::new(
         meili_host,
@@ -244,29 +341,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             Some(meili_key)
         },
-    ).expect("valid client");
+    )
+    .expect("valid meili client");
 
-    // Ensure index exists with primary key = resource_key.
-{
-    let mut idx = meili_client.index(&index_name);
-    if idx.fetch_info().await.is_err() {
-        let _ = meili_client.create_index(&index_name, Some("doc_id")).await;
+    // Ensure index exists with primary key = doc_id.
+    {
+        let mut idx = meili_client.index(&index_name);
+
+        if let Err(_) = idx.fetch_info().await {
+            let _ = meili_client.create_index(&index_name, Some("doc_id")).await;
+        }
     }
-}
+
+    // Spawn batching Meili indexer worker (optional)
+    let meili_tx = if meili_disabled {
+        warn!("MEILI_DISABLE=1 set; skipping Meilisearch indexing");
+        None
+    } else {
+        let (tx, rx) = mpsc::channel::<CacheIndexDoc>(meili_queue_cap);
+        tokio::spawn(meili_indexer_worker(
+            rx,
+            meili_client.clone(),
+            index_name.clone(),
+            Duration::from_millis(meili_flush_ms),
+            meili_batch_max,
+        ));
+        Some(tx)
+    };
 
     let state = Arc::new(AppState {
         db,
         meili_client,
         index_name,
         mem_resources: Arc::new(DashMap::new()),
+        meili_tx,
     });
 
-    {
-        let cleanup_state = state.clone();
-        tokio::spawn(async move {
-            run_cleanup_worker(cleanup_state).await;
-        });
-    }
+    // cleanup worker
+    tokio::spawn(run_cleanup_worker(state.clone()));
 
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     info!("Listening on http://{}", addr);
@@ -302,6 +414,7 @@ async fn handle(
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let path = req.uri().path().to_owned();
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
     match (req.method().as_str(), segments.as_slice()) {
         // POST /cache/index  (single item)
         ("POST", ["cache", "index"]) => handle_put_index(req, state).await,
@@ -344,8 +457,6 @@ async fn handle_put_index(
         }
     };
 
-    // Optional special header to attach website to this resource.
-    // Example: X-Cache-Site: example.com
     let header_site_key = headers
         .get("x-cache-site")
         .and_then(|v| v.to_str().ok())
@@ -396,9 +507,7 @@ async fn handle_put_index_batch(
     for payload in payloads {
         match index_single_entry(payload, header_site_key.clone(), state.clone()).await {
             Ok(_) => success += 1,
-            Err(e) => {
-                error!("Failed to index entry in batch: {e}");
-            }
+            Err(e) => error!("Failed to index entry in batch: {e}"),
         }
     }
 
@@ -416,9 +525,6 @@ async fn handle_put_index_batch(
 }
 
 /// GET /cache/resource/{resource_key}
-///
-/// - Default: JSON payload with base64 body (for Chrome, etc).
-/// - If `?raw=1` or `?format=bytes|raw`: raw bytes with original Content-Type.
 async fn handle_resource_lookup(
     req: Request<Incoming>,
     state: Arc<AppState>,
@@ -442,9 +548,7 @@ async fn handle_resource_lookup(
 
     let res = match get_resource_with_body(&state, &resource_key) {
         Ok(Some(res)) => res,
-        Ok(None) => {
-            return Ok(text_response(StatusCode::NOT_FOUND, "Resource not found"));
-        }
+        Ok(None) => return Ok(text_response(StatusCode::NOT_FOUND, "Resource not found")),
         Err(e) => {
             error!("Error loading resource {}: {}", resource_key, e);
             return Ok(text_response(
@@ -455,7 +559,6 @@ async fn handle_resource_lookup(
     };
 
     if wants_raw {
-        // Raw bytes response, use cached Content-Type if present.
         let content_type = res
             .resource
             .response_headers
@@ -475,7 +578,6 @@ async fn handle_resource_lookup(
             .unwrap());
     }
 
-    // Default JSON + base64 mode
     let payload = resource_with_body_to_payload(&res);
     let json = match serde_json::to_vec(&payload) {
         Ok(v) => v,
@@ -492,8 +594,6 @@ async fn handle_resource_lookup(
 }
 
 /// GET /cache/site/{website_key}
-///
-/// Returns all resources attached to this website as JSON with base64 bodies.
 async fn handle_site_lookup(
     website_key: &str,
     state: Arc<AppState>,
@@ -511,8 +611,6 @@ async fn handle_site_lookup(
                 if !key_bytes.starts_with(prefix.as_bytes()) {
                     break;
                 }
-
-                // Key is "site:{website_key}::{resource_key}"
                 let suffix = &key_bytes[prefix.len()..];
                 let resource_key = match std::str::from_utf8(suffix) {
                     Ok(s) => s.to_string(),
@@ -523,16 +621,11 @@ async fn handle_site_lookup(
                 };
 
                 match get_resource_with_body(&state, &resource_key) {
-                    Ok(Some(res)) => {
-                        let payload = resource_with_body_to_payload(&res);
-                        resources.push(payload);
-                    }
+                    Ok(Some(res)) => resources.push(resource_with_body_to_payload(&res)),
                     Ok(None) => {
-                        error!("Site index refers to missing resource_key {}", resource_key);
+                        error!("Site index refers to missing resource_key {}", resource_key)
                     }
-                    Err(e) => {
-                        error!("Failed to load resource {}: {}", resource_key, e);
-                    }
+                    Err(e) => error!("Failed to load resource {}: {}", resource_key, e),
                 }
             }
             Err(e) => {
@@ -556,13 +649,7 @@ async fn handle_site_lookup(
     Ok(json_response(StatusCode::OK, json))
 }
 
-/// Core logic to index a single entry:
-/// - figure out website_key (header, payload, or derived from URL)
-/// - compute file_id = hash(body)
-/// - store body once per file_id
-/// - store ResourceEntry per (website_key, resource_key)
-/// - add site index entry for fast per-website lookups
-/// - index in Meilisearch
+/// Core logic to index a single entry (RocksDB + mem), then enqueue Meili doc (batched).
 async fn index_single_entry(
     payload: Box<CachedEntryPayload>,
     header_site_key: Option<String>,
@@ -572,10 +659,6 @@ async fn index_single_entry(
         .decode(&payload.body_base64)
         .map_err(|e| format!("Invalid base64 body: {e}"))?;
 
-    // Determine website_key:
-    // 1) X-Cache-Site header (if provided)
-    // 2) payload.website_key
-    // 3) derive from URL (host)
     let website_key = header_site_key
         .or(payload.website_key.clone())
         .unwrap_or_else(|| derive_website_key_from_url(&payload.url));
@@ -584,6 +667,7 @@ async fn index_single_entry(
     } else {
         website_key
     };
+
     let file_id = compute_file_id(&body_bytes);
 
     let resource = ResourceEntry {
@@ -599,7 +683,7 @@ async fn index_single_entry(
         created_at: Some(now_unix_timestamp()),
     };
 
-    // --- In-memory cache (resource + body) ---
+    // --- In-memory cache ---
     state.mem_resources.insert(
         resource.resource_key.clone(),
         ResourceWithBody {
@@ -640,15 +724,14 @@ async fn index_single_entry(
         .put(res_key.as_bytes(), res_bytes)
         .map_err(|e| format!("RocksDB put resource error: {e}"))?;
 
-    // --- RocksDB: site index entry site:{website_key}::{resource_key} ---
+    // --- RocksDB: site index entry ---
     let site_key = format!("site:{}::{}", website_key, resource.resource_key);
-
     state
         .db
         .put(site_key.as_bytes(), b"")
         .map_err(|e| format!("RocksDB put site index error: {e}"))?;
 
-    // --- Meilisearch index ---
+    // --- Meili: enqueue doc (batched) ---
     let content_type = resource
         .response_headers
         .get("content-type")
@@ -664,19 +747,11 @@ async fn index_single_entry(
         content_type,
     };
 
-    let index = state.meili_client.index(&state.index_name);
-
-    if let Err(e) = index.add_documents(&[doc], Some("doc_id")).await {
-        // treat Meili failures as non-fatal for the cache
-        error!("Failed to index document in Meilisearch: {}", e);
-    }
+    enqueue_meili_doc(&state, doc);
 
     Ok(())
 }
 
-/// Get a ResourceWithBody by resource_key:
-/// - check in-memory first
-/// - then load ResourceEntry + FileEntry from RocksDB
 fn get_resource_with_body(
     state: &AppState,
     resource_key: &str,
@@ -719,7 +794,6 @@ fn get_resource_with_body(
         body: file_entry.body.clone(),
     };
 
-    // back-fill in-memory cache
     state
         .mem_resources
         .insert(resource_key.to_string(), combined.clone());
@@ -727,7 +801,6 @@ fn get_resource_with_body(
     Ok(Some(combined))
 }
 
-/// Convert internal `ResourceWithBody` into API payload (JSON with base64 body).
 fn resource_with_body_to_payload(res: &ResourceWithBody) -> CachedEntryPayload {
     CachedEntryPayload {
         website_key: Some(res.resource.website_key.clone()),
@@ -742,15 +815,11 @@ fn resource_with_body_to_payload(res: &ResourceWithBody) -> CachedEntryPayload {
     }
 }
 
-/// Compute a stable file_id hash for deduplication of shared assets (e.g. CDNs).
 fn compute_file_id(body: &[u8]) -> String {
     let hash = blake3::hash(body);
     hex::encode(hash.as_bytes())
 }
 
-/// Derive a website_key from URL if none is provided.
-///
-/// For example: "https://example.com/path" -> "example.com"
 fn derive_website_key_from_url(url_str: &str) -> String {
     match url::Url::parse(url_str) {
         Ok(url) => url.host_str().unwrap_or("unknown").to_string(),
@@ -758,7 +827,6 @@ fn derive_website_key_from_url(url_str: &str) -> String {
     }
 }
 
-/// Helper to build a plain text response.
 fn text_response(status: StatusCode, text: impl Into<String>) -> Response<ResponseBody> {
     let body = Full::from(Bytes::from(text.into()))
         .map_err(|never: Infallible| match never {})
@@ -771,7 +839,6 @@ fn text_response(status: StatusCode, text: impl Into<String>) -> Response<Respon
         .unwrap()
 }
 
-/// Helper to build a JSON response from pre-serialized bytes.
 fn json_response(status: StatusCode, json: Vec<u8>) -> Response<ResponseBody> {
     let body = Full::from(Bytes::from(json))
         .map_err(|never: Infallible| match never {})
@@ -795,14 +862,14 @@ fn cache_ttl_secs() -> i64 {
     std::env::var("CACHE_TTL_SECS")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(60 * 60 * 24) // default: 24 hours
+        .unwrap_or(60 * 60 * 24)
 }
 
 fn cleanup_interval() -> Duration {
     let secs = std::env::var("CACHE_CLEANUP_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60 * 10); // default: 10 minutes
+        .unwrap_or(60 * 10);
     Duration::from_secs(secs)
 }
 
@@ -847,7 +914,6 @@ fn do_rocksdb_cleanup(
         }
     }
 
-    // Delete expired resource metadata
     for res_key in &expired_resource_keys {
         let key = format!("res:{}", res_key);
         if let Err(e) = state.db.delete(key.as_bytes()) {
@@ -855,14 +921,12 @@ fn do_rocksdb_cleanup(
         }
     }
 
-    // Delete site index entries
     for site_key in &expired_site_keys {
         if let Err(e) = state.db.delete(site_key) {
             error!("Failed to delete site key during cleanup: {}", e);
         }
     }
 
-    // Compute orphaned file IDs: those used only by expired resources
     let mut orphaned_file_ids = Vec::new();
     for file_id in expired_file_ids {
         if !live_file_ids.contains(&file_id) {
@@ -870,7 +934,6 @@ fn do_rocksdb_cleanup(
         }
     }
 
-    // Delete orphaned file:* entries
     for file_id in &orphaned_file_ids {
         let file_key = format!("file:{}", file_id);
         if let Err(e) = state.db.delete(file_key.as_bytes()) {
@@ -900,8 +963,7 @@ async fn handle_cache_size(state: Arc<AppState>) -> Result<Response<ResponseBody
 /// A cleanup worker script
 async fn run_cleanup_worker(state: Arc<AppState>) {
     loop {
-        let interval = cleanup_interval();
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(cleanup_interval()).await;
 
         let ttl = cache_ttl_secs();
         let now = now_unix_timestamp();
@@ -925,20 +987,20 @@ async fn run_cleanup_worker(state: Arc<AppState>) {
                     );
                 }
 
-                // Remove docs from Meilisearch (best-effort)
+                // Remove docs from Meilisearch (best-effort) — delete by doc_id now.
                 if !expired_resource_keys.is_empty() {
+                    let doc_ids: Vec<String> = expired_resource_keys
+                        .iter()
+                        .map(|rk| meili_doc_id(rk))
+                        .collect();
                     let index = state.meili_client.index(&state.index_name);
-                    if let Err(e) = index.delete_documents(&expired_resource_keys).await {
+                    if let Err(e) = index.delete_documents(&doc_ids).await {
                         error!("Failed to delete documents from Meilisearch: {}", e);
                     }
                 }
             }
-            Ok(Err(e)) => {
-                error!("Cache cleanup error: {}", e);
-            }
-            Err(e) => {
-                error!("Cache cleanup join error: {}", e);
-            }
+            Ok(Err(e)) => error!("Cache cleanup error: {}", e),
+            Err(e) => error!("Cache cleanup join error: {}", e),
         }
     }
 }
@@ -946,10 +1008,8 @@ async fn run_cleanup_worker(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, sync::Arc};
     use tempfile::tempdir;
 
-    /// Create an AppState that uses a temporary RocksDB directory.
     fn create_test_state() -> Arc<AppState> {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
@@ -957,16 +1017,19 @@ mod tests {
 
         let db = Arc::new(DB::open_default(path).expect("open rocksdb"));
 
+        // No Meili worker in tests.
         let meili_client = MeiliClient::new(
             "http://127.0.0.1:7700".to_string(),
             Some("testMasterKey".to_string()),
-        ).expect("valid client");
+        )
+        .expect("valid client");
 
         Arc::new(AppState {
             db,
             meili_client,
             index_name: "test_index".to_string(),
             mem_resources: Arc::new(DashMap::new()),
+            meili_tx: None,
         })
     }
 
@@ -1008,10 +1071,7 @@ mod tests {
         assert_eq!(res.body, body_bytes);
 
         let site_key = format!("site:{}::{}", "example.com", resource_key);
-        assert!(
-            state.db.get(site_key.as_bytes()).unwrap().is_some(),
-            "site index entry should exist"
-        );
+        assert!(state.db.get(site_key.as_bytes()).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1058,10 +1118,7 @@ mod tests {
             .expect("get_resource_with_body 2")
             .expect("resource 2 exists");
 
-        assert_eq!(
-            res1.resource.file_id, res2.resource.file_id,
-            "resources with same body should share file_id"
-        );
+        assert_eq!(res1.resource.file_id, res2.resource.file_id);
 
         let mut file_keys = 0usize;
         for item in state.db.iterator(rocksdb::IteratorMode::Start) {
@@ -1071,9 +1128,6 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            file_keys, 1,
-            "only one file:* entry should exist for the shared body"
-        );
+        assert_eq!(file_keys, 1);
     }
 }
