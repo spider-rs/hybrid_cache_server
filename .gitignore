@@ -4,3 +4,6 @@ meilisearch
 cache_db
 data.ms
 dumps
+# meilisearch
+meili_data
+meili_dumps
