@@ -623,7 +623,10 @@ async fn handle_site_lookup(
                 match get_resource_with_body(&state, &resource_key) {
                     Ok(Some(res)) => resources.push(resource_with_body_to_payload(&res)),
                     Ok(None) => {
-                        error!("Site index refers to missing resource_key {}", resource_key)
+                        error!("Site index refers to missing resource_key {}", resource_key);
+                        if let Err(e) = state.db.delete(&key_bytes) {
+                            error!("Failed to delete dangling site index key: {}", e);
+                        }
                     }
                     Err(e) => error!("Failed to load resource {}: {}", resource_key, e),
                 }
@@ -914,18 +917,23 @@ fn do_rocksdb_cleanup(
         }
     }
 
-    for res_key in &expired_resource_keys {
-        let key = format!("res:{}", res_key);
-        if let Err(e) = state.db.delete(key.as_bytes()) {
-            error!("Failed to delete resource key {}: {}", res_key, e);
-        }
+    let mut batch = rocksdb::WriteBatch::default();
+
+    // delete resources
+    for rk in &expired_resource_keys {
+        let key = format!("res:{}", rk);
+        batch.delete(key.as_bytes());
     }
 
+    // delete site index entries
     for site_key in &expired_site_keys {
-        if let Err(e) = state.db.delete(site_key) {
-            error!("Failed to delete site key during cleanup: {}", e);
-        }
+        batch.delete(site_key);
     }
+
+    state
+        .db
+        .write(batch)
+        .map_err(|e| format!("RocksDB batch delete (res+site) error: {e}"))?;
 
     let mut orphaned_file_ids = Vec::new();
     for file_id in expired_file_ids {
