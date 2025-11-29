@@ -238,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             Some(meili_key)
         },
-    );
+    ).expect("valid client");
 
     // Ensure index exists with primary key = resource_key.
     {
@@ -955,7 +955,7 @@ mod tests {
         let meili_client = MeiliClient::new(
             "http://127.0.0.1:7700".to_string(),
             Some("testMasterKey".to_string()),
-        );
+        ).expect("valid client");
 
         Arc::new(AppState {
             db,
