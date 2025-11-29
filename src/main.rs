@@ -184,8 +184,8 @@ pub enum HttpVersion {
 ///   - example: `"example.com"` or `"https://example.com"`
 /// - `resource_key` – your unique cache key per resource (from put_hybrid_cache)
 ///   - example:
-///       "GET::https://example.com/style.css"
-///       "GET::https://cdn.example.com/jquery.js::Accept:text/javascript"
+///       "GET:https://example.com/style.css"
+///       "GET:https://cdn.example.com/jquery.js::Accept:text/javascript"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedEntryPayload {
     /// Website-level key (optional in payload; we can also accept header or derive from URL).
@@ -206,11 +206,17 @@ struct CachedEntryPayload {
 /// Minimal document indexed in Meilisearch for search/lookup.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheIndexDoc {
+    doc_id: String,    
     website_key: String,
     resource_key: String,
     url: String,
     status: u16,
     content_type: Option<String>,
+}
+
+fn meili_doc_id(resource_key: &str) -> String {
+    let h = blake3::hash(resource_key.as_bytes());
+    hex::encode(h.as_bytes()) // only [0-9a-f]
 }
 
 #[tokio::main]
@@ -241,14 +247,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ).expect("valid client");
 
     // Ensure index exists with primary key = resource_key.
-    {
-        let mut idx = meili_client.index(&index_name);
-        if idx.fetch_info().await.is_err() {
-            let _ = meili_client
-                .create_index(&index_name, Some("resource_key"))
-                .await;
-        }
+{
+    let mut idx = meili_client.index(&index_name);
+    if idx.fetch_info().await.is_err() {
+        let _ = meili_client.create_index(&index_name, Some("doc_id")).await;
     }
+}
 
     let state = Arc::new(AppState {
         db,
@@ -652,6 +656,7 @@ async fn index_single_entry(
         .or_else(|| resource.response_headers.get("Content-Type").cloned());
 
     let doc = CacheIndexDoc {
+        doc_id: meili_doc_id(&resource.resource_key),
         website_key,
         resource_key: resource.resource_key.clone(),
         url: resource.url.clone(),
@@ -661,7 +666,7 @@ async fn index_single_entry(
 
     let index = state.meili_client.index(&state.index_name);
 
-    if let Err(e) = index.add_documents(&[doc], Some("resource_key")).await {
+    if let Err(e) = index.add_documents(&[doc], Some("doc_id")).await {
         // treat Meili failures as non-fatal for the cache
         error!("Failed to index document in Meilisearch: {}", e);
     }
@@ -979,7 +984,7 @@ mod tests {
 
         let payload = Box::new(CachedEntryPayload {
             website_key: Some("example.com".to_string()),
-            resource_key: "GET::https://example.com/script.js".to_string(),
+            resource_key: "GET:https://example.com/script.js".to_string(),
             url: "https://example.com/script.js".to_string(),
             method: "GET".to_string(),
             status: 200,
@@ -993,7 +998,7 @@ mod tests {
             .await
             .expect("index_single_entry");
 
-        let resource_key = "GET::https://example.com/script.js";
+        let resource_key = "GET:https://example.com/script.js";
         let res = get_resource_with_body(&state, resource_key)
             .expect("get_resource_with_body")
             .expect("resource exists");
@@ -1017,7 +1022,7 @@ mod tests {
 
         let payload1 = Box::new(CachedEntryPayload {
             website_key: Some("example.com".to_string()),
-            resource_key: "GET::https://example.com/shared.js".to_string(),
+            resource_key: "GET:https://example.com/shared.js".to_string(),
             url: "https://example.com/shared.js".to_string(),
             method: "GET".to_string(),
             status: 200,
@@ -1029,7 +1034,7 @@ mod tests {
 
         let payload2 = Box::new(CachedEntryPayload {
             website_key: Some("other.com".to_string()),
-            resource_key: "GET::https://cdn.example.com/shared.js".to_string(),
+            resource_key: "GET:https://cdn.example.com/shared.js".to_string(),
             url: "https://cdn.example.com/shared.js".to_string(),
             method: "GET".to_string(),
             status: 200,
@@ -1046,10 +1051,10 @@ mod tests {
             .await
             .expect("index_single_entry 2");
 
-        let res1 = get_resource_with_body(&state, "GET::https://example.com/shared.js")
+        let res1 = get_resource_with_body(&state, "GET:https://example.com/shared.js")
             .expect("get_resource_with_body 1")
             .expect("resource 1 exists");
-        let res2 = get_resource_with_body(&state, "GET::https://cdn.example.com/shared.js")
+        let res2 = get_resource_with_body(&state, "GET:https://cdn.example.com/shared.js")
             .expect("get_resource_with_body 2")
             .expect("resource 2 exists");
 
