@@ -1166,7 +1166,11 @@ fn do_purge_empty(state: &AppState) -> Result<PurgeResult, String> {
         .map_err(|e| format!("RocksDB batch delete error: {e}"))?;
 
     // Phase 4: delete orphaned file entries (not referenced by any remaining resource).
+    // Also delete empty file entries that have NO resource references at all
+    // (orphaned from previous TTL cleanups that only removed res: entries).
     let mut purged_files = 0usize;
+
+    // Files referenced by purged resources but not by live resources
     for file_id in &referenced_file_ids {
         if !live_file_ids.contains(file_id) {
             let file_key = format!("file:{}", file_id);
@@ -1174,6 +1178,21 @@ fn do_purge_empty(state: &AppState) -> Result<PurgeResult, String> {
                 error!("Failed to delete file entry {}: {}", file_id, e);
             } else {
                 purged_files += 1;
+            }
+        }
+    }
+
+    // Also delete empty file entries with zero resource references (truly orphaned)
+    for file_id in &empty_file_ids {
+        if !referenced_file_ids.contains(file_id) && !live_file_ids.contains(file_id) {
+            let file_key = format!("file:{}", file_id);
+            // Check it still exists before counting
+            if state.db.get(file_key.as_bytes()).map_err(|e| format!("RocksDB get error: {e}"))?.is_some() {
+                if let Err(e) = state.db.delete(file_key.as_bytes()) {
+                    error!("Failed to delete orphaned file entry {}: {}", file_id, e);
+                } else {
+                    purged_files += 1;
+                }
             }
         }
     }
