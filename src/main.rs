@@ -955,19 +955,41 @@ fn do_rocksdb_cleanup(
 }
 
 /// Returns true if `body` looks like an empty HTML page (no meaningful text content).
+/// Also handles base64-encoded bodies transparently.
 fn is_empty_html(body: &[u8]) -> bool {
-    let text = match std::str::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
+    if body.is_empty() {
+        return true;
+    }
 
+    // Try raw bytes first.
+    if let Ok(text) = std::str::from_utf8(body) {
+        if is_empty_html_str(text) {
+            return true;
+        }
+
+        // Body might be base64-encoded; try decoding it.
+        let trimmed = text.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('<') {
+            if let Ok(decoded) = general_purpose::STANDARD.decode(trimmed.as_bytes()) {
+                if let Ok(decoded_text) = std::str::from_utf8(&decoded) {
+                    if is_empty_html_str(decoded_text) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Core check: is this text string an empty HTML page?
+fn is_empty_html_str(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return true;
     }
 
-    // Strip the HTML to just text content and check if anything remains.
-    // Fast path: match known empty-page patterns.
     let lower = trimmed.to_ascii_lowercase();
 
     // Remove optional doctype
@@ -1027,13 +1049,69 @@ fn known_empty_page_file_ids() -> HashSet<String> {
         .collect()
 }
 
-/// Scan `res:` entries for resources pointing to known empty-page file_ids, then delete them.
-fn do_purge_empty(state: &AppState) -> Result<PurgeResult, String> {
-    // Phase 1: build set of empty-page file_ids from known patterns.
-    let empty_file_ids = known_empty_page_file_ids();
+/// Scan file entries for empty HTML bodies, returning their file_ids.
+/// Only deserializes entries whose raw JSON value is small (< max_value_bytes),
+/// since empty HTML bodies produce tiny file entries.
+fn scan_empty_file_ids(state: &AppState, max_value_bytes: usize) -> Result<HashSet<String>, String> {
+    let mut empty_file_ids: HashSet<String> = HashSet::new();
+    let mut scanned = 0u64;
+    let mut skipped_large = 0u64;
+
+    let iter = state
+        .db
+        .iterator(IteratorMode::From(b"file:", Direction::Forward));
+
+    for item in iter {
+        let (key, value) = item.map_err(|e| format!("RocksDB iterator error: {e}"))?;
+        if !key.starts_with(b"file:") {
+            break;
+        }
+
+        // Skip large values — they can't be empty HTML pages.
+        if value.len() > max_value_bytes {
+            skipped_large += 1;
+            continue;
+        }
+
+        scanned += 1;
+
+        let file_entry: FileEntry = match serde_json::from_slice(&value) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to deserialize FileEntry during purge scan: {e}");
+                continue;
+            }
+        };
+
+        if is_empty_html(&file_entry.body) {
+            info!("purge_empty: found empty file_id={} body_len={}", file_entry.file_id, file_entry.body.len());
+            empty_file_ids.insert(file_entry.file_id);
+        }
+    }
 
     info!(
-        "purge_empty: checking against {} known empty-page file_ids",
+        "purge_empty: scanned {} small file entries, skipped {} large, found {} empty",
+        scanned, skipped_large, empty_file_ids.len()
+    );
+
+    Ok(empty_file_ids)
+}
+
+/// Purge resources with empty HTML bodies.
+/// Strategy: fast-path with pre-computed hashes, then fallback to scanning small file entries.
+fn do_purge_empty(state: &AppState) -> Result<PurgeResult, String> {
+    // Phase 1a: try known patterns first (instant).
+    let mut empty_file_ids = known_empty_page_file_ids();
+
+    // Phase 1b: also scan small file entries to catch unknown variations.
+    // Empty HTML body ~38 bytes → serde JSON array ~230 bytes, but a base64-
+    // encoded body or extra whitespace variants could be larger.
+    // Threshold of 2048 is generous and skips >99% of real content files.
+    let scanned = scan_empty_file_ids(state, 2048)?;
+    empty_file_ids.extend(scanned);
+
+    info!(
+        "purge_empty: total {} empty-page file_ids to match",
         empty_file_ids.len()
     );
 
