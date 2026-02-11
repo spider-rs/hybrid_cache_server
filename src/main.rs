@@ -1006,44 +1006,34 @@ struct PurgeResult {
     resource_keys: Vec<String>,
 }
 
-/// Scan all file entries for empty HTML bodies, then delete matching resources.
+/// Known empty HTML page bodies. Pre-computing their BLAKE3 file_ids lets us
+/// scan only the lightweight `res:` entries instead of deserializing every
+/// multi-KB `file:` body (which is 10x+ slower on large caches).
+fn known_empty_page_file_ids() -> HashSet<String> {
+    let patterns: &[&[u8]] = &[
+        b"<html><head></head><body></body></html>",
+        b"<!DOCTYPE html><html><head></head><body></body></html>",
+        b"<!doctype html><html><head></head><body></body></html>",
+        b"<html>\n<head></head>\n<body></body>\n</html>",
+        b"<html>\n  <head></head>\n  <body></body>\n</html>",
+        b"<html><head></head><body>\n</body></html>",
+        b"<html><head>\n</head><body>\n</body></html>",
+        b"",
+    ];
+
+    patterns
+        .iter()
+        .map(|p| compute_file_id(p))
+        .collect()
+}
+
+/// Scan `res:` entries for resources pointing to known empty-page file_ids, then delete them.
 fn do_purge_empty(state: &AppState) -> Result<PurgeResult, String> {
-    // Phase 1: find all file_ids with empty HTML bodies.
-    let mut empty_file_ids: HashSet<String> = HashSet::new();
-
-    let iter = state
-        .db
-        .iterator(IteratorMode::From(b"file:", Direction::Forward));
-
-    for item in iter {
-        let (key, value) = item.map_err(|e| format!("RocksDB iterator error: {e}"))?;
-        if !key.starts_with(b"file:") {
-            break;
-        }
-
-        let file_entry: FileEntry = match serde_json::from_slice(&value) {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Failed to deserialize FileEntry during purge: {e}");
-                continue;
-            }
-        };
-
-        if is_empty_html(&file_entry.body) {
-            empty_file_ids.insert(file_entry.file_id);
-        }
-    }
-
-    if empty_file_ids.is_empty() {
-        return Ok(PurgeResult {
-            purged_resources: 0,
-            purged_files: 0,
-            resource_keys: Vec::new(),
-        });
-    }
+    // Phase 1: build set of empty-page file_ids from known patterns.
+    let empty_file_ids = known_empty_page_file_ids();
 
     info!(
-        "purge_empty: found {} empty-page file_ids",
+        "purge_empty: checking against {} known empty-page file_ids",
         empty_file_ids.len()
     );
 
