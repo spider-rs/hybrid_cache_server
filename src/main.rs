@@ -1190,53 +1190,53 @@ fn do_purge_empty(state: &AppState) -> Result<PurgeResult, String> {
     })
 }
 
-/// POST /cache/purge/empty – remove resources whose body is an empty HTML page.
+/// POST /cache/purge/empty – fire-and-forget: spawns background purge, returns immediately.
 async fn handle_purge_empty(
     state: Arc<AppState>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let meili_client = state.meili_client.clone();
     let index_name = state.index_name.clone();
 
-    let result = tokio::task::spawn_blocking(move || do_purge_empty(&state)).await;
+    // Spawn the heavy work as a detached background task so it survives
+    // the HTTP connection being closed by the client.
+    tokio::spawn(async move {
+        let state_blocking = state.clone();
+        let result =
+            tokio::task::spawn_blocking(move || do_purge_empty(&state_blocking)).await;
 
-    match result {
-        Ok(Ok(purge_result)) => {
-            info!(
-                "purge_empty: removed {} resources, {} file bodies",
-                purge_result.purged_resources, purge_result.purged_files
-            );
+        match result {
+            Ok(Ok(purge_result)) => {
+                info!(
+                    "purge_empty DONE: removed {} resources, {} file bodies",
+                    purge_result.purged_resources, purge_result.purged_files
+                );
 
-            // Best-effort Meilisearch cleanup.
-            if !purge_result.resource_keys.is_empty() {
-                let doc_ids: Vec<String> = purge_result
-                    .resource_keys
-                    .iter()
-                    .map(|rk| meili_doc_id(rk))
-                    .collect();
-                let index = meili_client.index(&index_name);
-                if let Err(e) = index.delete_documents(&doc_ids).await {
-                    error!("purge_empty: meili delete error: {}", e);
+                // Best-effort Meilisearch cleanup.
+                if !purge_result.resource_keys.is_empty() {
+                    let doc_ids: Vec<String> = purge_result
+                        .resource_keys
+                        .iter()
+                        .map(|rk| meili_doc_id(rk))
+                        .collect();
+                    let index = meili_client.index(&index_name);
+                    if let Err(e) = index.delete_documents(&doc_ids).await {
+                        error!("purge_empty: meili delete error: {}", e);
+                    }
                 }
             }
+            Ok(Err(e)) => error!("purge_empty error: {}", e),
+            Err(e) => error!("purge_empty join error: {}", e),
+        }
+    });
 
-            let json = serde_json::to_vec(&purge_result).unwrap_or_else(|_| b"{}".to_vec());
-            Ok(json_response(StatusCode::OK, json))
-        }
-        Ok(Err(e)) => {
-            error!("purge_empty error: {}", e);
-            Ok(text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Purge error: {}", e),
-            ))
-        }
-        Err(e) => {
-            error!("purge_empty join error: {}", e);
-            Ok(text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Purge task failed",
-            ))
-        }
-    }
+    Ok(json_response(
+        StatusCode::ACCEPTED,
+        serde_json::to_vec(&serde_json::json!({
+            "status": "started",
+            "message": "Purge running in background. Check logs for results."
+        }))
+        .unwrap(),
+    ))
 }
 
 async fn handle_cache_size(state: Arc<AppState>) -> Result<Response<ResponseBody>, hyper::Error> {
