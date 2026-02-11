@@ -429,6 +429,8 @@ async fn handle(
         ("GET", ["cache", "site", website_key]) => handle_site_lookup(website_key, state).await,
         // GET /cache/size
         ("GET", ["cache", "size"]) => handle_cache_size(state).await,
+        // POST /cache/purge/empty – remove resources with empty HTML bodies
+        ("POST", ["cache", "purge", "empty"]) => handle_purge_empty(state).await,
         _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
     }
 }
@@ -952,6 +954,223 @@ fn do_rocksdb_cleanup(
     Ok((expired_resource_keys, orphaned_file_ids))
 }
 
+/// Returns true if `body` looks like an empty HTML page (no meaningful text content).
+fn is_empty_html(body: &[u8]) -> bool {
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Strip the HTML to just text content and check if anything remains.
+    // Fast path: match known empty-page patterns.
+    let lower = trimmed.to_ascii_lowercase();
+
+    // Remove optional doctype
+    let html = lower
+        .strip_prefix("<!doctype html>")
+        .unwrap_or(&lower)
+        .trim();
+
+    // Must start with <html
+    if !html.starts_with("<html") {
+        return false;
+    }
+
+    // Strip all tags, then check if any non-whitespace text remains.
+    let mut inside_tag = false;
+    let mut has_text = false;
+
+    for ch in html.chars() {
+        if ch == '<' {
+            inside_tag = true;
+        } else if ch == '>' {
+            inside_tag = false;
+        } else if !inside_tag && !ch.is_whitespace() {
+            has_text = true;
+            break;
+        }
+    }
+
+    !has_text
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PurgeResult {
+    purged_resources: usize,
+    purged_files: usize,
+    resource_keys: Vec<String>,
+}
+
+/// Scan all file entries for empty HTML bodies, then delete matching resources.
+fn do_purge_empty(state: &AppState) -> Result<PurgeResult, String> {
+    // Phase 1: find all file_ids with empty HTML bodies.
+    let mut empty_file_ids: HashSet<String> = HashSet::new();
+
+    let iter = state
+        .db
+        .iterator(IteratorMode::From(b"file:", Direction::Forward));
+
+    for item in iter {
+        let (key, value) = item.map_err(|e| format!("RocksDB iterator error: {e}"))?;
+        if !key.starts_with(b"file:") {
+            break;
+        }
+
+        let file_entry: FileEntry = match serde_json::from_slice(&value) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to deserialize FileEntry during purge: {e}");
+                continue;
+            }
+        };
+
+        if is_empty_html(&file_entry.body) {
+            empty_file_ids.insert(file_entry.file_id);
+        }
+    }
+
+    if empty_file_ids.is_empty() {
+        return Ok(PurgeResult {
+            purged_resources: 0,
+            purged_files: 0,
+            resource_keys: Vec::new(),
+        });
+    }
+
+    info!(
+        "purge_empty: found {} empty-page file_ids",
+        empty_file_ids.len()
+    );
+
+    // Phase 2: scan all res: entries and collect those referencing empty file_ids.
+    let mut purge_resource_keys = Vec::new();
+    let mut purge_site_keys: Vec<Vec<u8>> = Vec::new();
+    let mut referenced_file_ids: HashSet<String> = HashSet::new();
+    let mut live_file_ids: HashSet<String> = HashSet::new();
+
+    let iter = state
+        .db
+        .iterator(IteratorMode::From(b"res:", Direction::Forward));
+
+    for item in iter {
+        let (key, value) = item.map_err(|e| format!("RocksDB iterator error: {e}"))?;
+        if !key.starts_with(b"res:") {
+            break;
+        }
+
+        let resource: ResourceEntry = match serde_json::from_slice(&value) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to deserialize ResourceEntry during purge: {e}");
+                continue;
+            }
+        };
+
+        if empty_file_ids.contains(&resource.file_id) {
+            purge_resource_keys.push(resource.resource_key.clone());
+            referenced_file_ids.insert(resource.file_id.clone());
+
+            let site_key = format!("site:{}::{}", resource.website_key, resource.resource_key);
+            purge_site_keys.push(site_key.into_bytes());
+        } else {
+            live_file_ids.insert(resource.file_id.clone());
+        }
+    }
+
+    // Phase 3: batch delete resources + site index entries.
+    let mut batch = rocksdb::WriteBatch::default();
+
+    for rk in &purge_resource_keys {
+        batch.delete(format!("res:{}", rk).as_bytes());
+    }
+    for site_key in &purge_site_keys {
+        batch.delete(site_key);
+    }
+
+    state
+        .db
+        .write(batch)
+        .map_err(|e| format!("RocksDB batch delete error: {e}"))?;
+
+    // Phase 4: delete orphaned file entries (not referenced by any remaining resource).
+    let mut purged_files = 0usize;
+    for file_id in &referenced_file_ids {
+        if !live_file_ids.contains(file_id) {
+            let file_key = format!("file:{}", file_id);
+            if let Err(e) = state.db.delete(file_key.as_bytes()) {
+                error!("Failed to delete file entry {}: {}", file_id, e);
+            } else {
+                purged_files += 1;
+            }
+        }
+    }
+
+    // Phase 5: evict from in-memory cache.
+    for rk in &purge_resource_keys {
+        state.mem_resources.remove(rk);
+    }
+
+    Ok(PurgeResult {
+        purged_resources: purge_resource_keys.len(),
+        purged_files,
+        resource_keys: purge_resource_keys,
+    })
+}
+
+/// POST /cache/purge/empty – remove resources whose body is an empty HTML page.
+async fn handle_purge_empty(
+    state: Arc<AppState>,
+) -> Result<Response<ResponseBody>, hyper::Error> {
+    let meili_client = state.meili_client.clone();
+    let index_name = state.index_name.clone();
+
+    let result = tokio::task::spawn_blocking(move || do_purge_empty(&state)).await;
+
+    match result {
+        Ok(Ok(purge_result)) => {
+            info!(
+                "purge_empty: removed {} resources, {} file bodies",
+                purge_result.purged_resources, purge_result.purged_files
+            );
+
+            // Best-effort Meilisearch cleanup.
+            if !purge_result.resource_keys.is_empty() {
+                let doc_ids: Vec<String> = purge_result
+                    .resource_keys
+                    .iter()
+                    .map(|rk| meili_doc_id(rk))
+                    .collect();
+                let index = meili_client.index(&index_name);
+                if let Err(e) = index.delete_documents(&doc_ids).await {
+                    error!("purge_empty: meili delete error: {}", e);
+                }
+            }
+
+            let json = serde_json::to_vec(&purge_result).unwrap_or_else(|_| b"{}".to_vec());
+            Ok(json_response(StatusCode::OK, json))
+        }
+        Ok(Err(e)) => {
+            error!("purge_empty error: {}", e);
+            Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Purge error: {}", e),
+            ))
+        }
+        Err(e) => {
+            error!("purge_empty join error: {}", e);
+            Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Purge task failed",
+            ))
+        }
+    }
+}
+
 async fn handle_cache_size(state: Arc<AppState>) -> Result<Response<ResponseBody>, hyper::Error> {
     let report = match cache_size_report(&state, "cache_db") {
         Ok(r) => r,
@@ -1137,5 +1356,109 @@ mod tests {
         }
 
         assert_eq!(file_keys, 1);
+    }
+
+    #[test]
+    fn is_empty_html_detects_empty_pages() {
+        // Exact match from user report
+        assert!(is_empty_html(b"<html><head></head><body></body></html>"));
+        // With doctype
+        assert!(is_empty_html(
+            b"<!DOCTYPE html><html><head></head><body></body></html>"
+        ));
+        // With whitespace / newlines
+        assert!(is_empty_html(
+            b"<html>\n  <head></head>\n  <body>  </body>\n</html>"
+        ));
+        // With attributes on tags
+        assert!(is_empty_html(
+            b"<html lang=\"en\"><head></head><body class=\"x\"></body></html>"
+        ));
+        // Empty string
+        assert!(is_empty_html(b""));
+        // Just whitespace
+        assert!(is_empty_html(b"   \n\t  "));
+    }
+
+    #[test]
+    fn is_empty_html_rejects_non_empty_pages() {
+        // Has text content
+        assert!(!is_empty_html(
+            b"<html><head></head><body>Hello</body></html>"
+        ));
+        // Not HTML at all
+        assert!(!is_empty_html(b"console.log('hi');"));
+        // Binary content
+        assert!(!is_empty_html(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        // Has nested element with text
+        assert!(!is_empty_html(
+            b"<html><head><title>Test</title></head><body></body></html>"
+        ));
+    }
+
+    #[tokio::test]
+    async fn purge_empty_removes_empty_html_resources() {
+        let state = create_test_state();
+
+        // Index an empty HTML page
+        let empty_body = b"<html><head></head><body></body></html>";
+        let payload_empty = Box::new(CachedEntryPayload {
+            website_key: Some("example.com".to_string()),
+            resource_key: "GET:https://example.com/".to_string(),
+            url: "https://example.com/".to_string(),
+            method: "GET".to_string(),
+            status: 200,
+            request_headers: HashMap::new(),
+            response_headers: HashMap::new(),
+            body_base64: general_purpose::STANDARD.encode(empty_body),
+            http_version: HttpVersion::Http11,
+        });
+
+        // Index a real page
+        let real_body = b"<html><head></head><body><h1>Hello World</h1></body></html>";
+        let payload_real = Box::new(CachedEntryPayload {
+            website_key: Some("example.com".to_string()),
+            resource_key: "GET:https://example.com/about".to_string(),
+            url: "https://example.com/about".to_string(),
+            method: "GET".to_string(),
+            status: 200,
+            request_headers: HashMap::new(),
+            response_headers: HashMap::new(),
+            body_base64: general_purpose::STANDARD.encode(real_body),
+            http_version: HttpVersion::Http11,
+        });
+
+        index_single_entry(payload_empty, None, state.clone())
+            .await
+            .expect("index empty");
+        index_single_entry(payload_real, None, state.clone())
+            .await
+            .expect("index real");
+
+        // Both should exist before purge
+        assert!(get_resource_with_body(&state, "GET:https://example.com/")
+            .unwrap()
+            .is_some());
+        assert!(get_resource_with_body(&state, "GET:https://example.com/about")
+            .unwrap()
+            .is_some());
+
+        // Clear mem cache so purge eviction is testable
+        state.mem_resources.clear();
+
+        let result = do_purge_empty(&state).expect("purge_empty");
+        assert_eq!(result.purged_resources, 1);
+        assert_eq!(result.purged_files, 1);
+        assert_eq!(result.resource_keys, vec!["GET:https://example.com/"]);
+
+        // Empty page should be gone
+        assert!(get_resource_with_body(&state, "GET:https://example.com/")
+            .unwrap()
+            .is_none());
+
+        // Real page should still exist
+        assert!(get_resource_with_body(&state, "GET:https://example.com/about")
+            .unwrap()
+            .is_some());
     }
 }
