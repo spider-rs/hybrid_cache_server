@@ -200,6 +200,15 @@ struct CacheIndexDoc {
     content_type: Option<String>,
 }
 
+/// Pre-processed entry ready for a single RocksDB WriteBatch commit.
+struct PreparedEntry {
+    resource: ResourceEntry,
+    body: Bytes,
+    file_id: String,
+    website_key: String,
+    meili_doc: CacheIndexDoc,
+}
+
 fn meili_doc_id(resource_key: &str) -> String {
     let h = blake3::hash(resource_key.as_bytes());
     hex::encode(h.as_bytes())
@@ -419,8 +428,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Listening on http://{}", addr);
 
     let listener = TcpListener::bind(addr).await?;
+
+    let max_conns = env_u64("MAX_CONNECTIONS", 10_000) as usize;
+    let sem = Arc::new(tokio::sync::Semaphore::new(max_conns));
+
     loop {
         let (stream, _peer) = listener.accept().await?;
+        let _ = stream.set_nodelay(true); // disable Nagle for low-latency responses
+
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => continue, // semaphore closed — should not happen
+        };
 
         let io = TokioIo::new(stream);
         let state = state.clone();
@@ -437,6 +456,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             {
                 error!("Error serving connection: {:?}", err);
             }
+
+            drop(permit); // release connection slot
         });
     }
 }
@@ -539,24 +560,33 @@ async fn handle_put_index_batch(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let mut success = 0usize;
+    let mut prepared = Vec::with_capacity(payloads.len());
     for payload in payloads {
-        match index_single_entry(payload, header_site_key.clone(), state.clone()).await {
-            Ok(_) => success += 1,
-            Err(e) => error!("Failed to index entry in batch: {e}"),
+        match prepare_entry(payload, header_site_key.as_deref()) {
+            Ok(p) => prepared.push(p),
+            Err(e) => error!("Failed to prepare entry in batch: {e}"),
         }
     }
 
-    if success == 0 {
-        Ok(text_response(
+    if prepared.is_empty() {
+        return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "No entries indexed",
-        ))
-    } else {
-        Ok(text_response(
+        ));
+    }
+
+    match commit_entries(&state, prepared).await {
+        Ok(count) => Ok(text_response(
             StatusCode::CREATED,
-            format!("Indexed {} entries", success),
-        ))
+            format!("Indexed {} entries", count),
+        )),
+        Err(e) => {
+            error!("Failed to commit batch: {e}");
+            Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Index error",
+            ))
+        }
     }
 }
 
@@ -688,17 +718,41 @@ async fn handle_site_lookup(
     Ok(json_response(StatusCode::OK, json))
 }
 
-/// Core logic to index a single entry (RocksDB + mem), then enqueue Meili doc (batched).
-async fn index_single_entry(
+/// Load file body from RocksDB with backwards-compatible format detection.
+/// New format: raw bytes stored directly.
+/// Legacy format: JSON `{"file_id":"...","body":[...]}`.
+fn load_file_body(db: &DB, file_id: &str) -> Result<Option<Bytes>, String> {
+    let file_key = format!("file:{}", file_id);
+    let pinned = db
+        .get_pinned(file_key.as_bytes())
+        .map_err(|e| format!("RocksDB get file error: {e}"))?;
+
+    let Some(raw) = pinned else {
+        return Ok(None);
+    };
+
+    if raw.first() == Some(&b'{') {
+        // Legacy JSON format
+        let file_entry: FileEntry = serde_json::from_slice(&raw)
+            .map_err(|e| format!("Deserialize FileEntry (legacy) error: {e}"))?;
+        Ok(Some(Bytes::from(file_entry.body)))
+    } else {
+        // New raw bytes format
+        Ok(Some(Bytes::copy_from_slice(&raw)))
+    }
+}
+
+/// Decode and validate a single payload into a `PreparedEntry` (pure computation, no I/O).
+fn prepare_entry(
     payload: Box<CachedEntryPayload>,
-    header_site_key: Option<String>,
-    state: Arc<AppState>,
-) -> Result<(), String> {
+    header_site_key: Option<&str>,
+) -> Result<PreparedEntry, String> {
     let body_bytes = general_purpose::STANDARD
         .decode(&payload.body_base64)
         .map_err(|e| format!("Invalid base64 body: {e}"))?;
 
     let website_key = header_site_key
+        .map(|s| s.to_string())
         .or(payload.website_key.clone())
         .unwrap_or_else(|| derive_website_key_from_url(&payload.url));
     let website_key = if website_key.is_empty() {
@@ -708,6 +762,7 @@ async fn index_single_entry(
     };
 
     let file_id = compute_file_id(&body_bytes);
+    let body = Bytes::from(body_bytes);
 
     let resource = ResourceEntry {
         website_key: website_key.clone(),
@@ -722,60 +777,108 @@ async fn index_single_entry(
         created_at: Some(now_unix_timestamp()),
     };
 
-    let body = Bytes::from(body_bytes);
-
-    // --- In-memory cache ---
-    state.mem_resources.insert(
-        resource.resource_key.clone(),
-        ResourceWithBody {
-            resource: resource.clone(),
-            body: body.clone(),
-        },
-    );
-
-    // --- RocksDB: atomic batch write (file + resource + site index) ---
-    let file_key = format!("file:{}", file_id);
-    let file_entry = FileEntry {
-        file_id: file_id.clone(),
-        body: body.to_vec(),
-    };
-    let file_bytes = serde_json::to_vec(&file_entry)
-        .map_err(|e| format!("Serialize FileEntry error: {e}"))?;
-
-    let res_key = format!("res:{}", resource.resource_key);
-    let res_bytes =
-        serde_json::to_vec(&resource).map_err(|e| format!("Serialize ResourceEntry error: {e}"))?;
-
-    let site_key = format!("site:{}::{}", website_key, resource.resource_key);
-
-    let mut batch = rocksdb::WriteBatch::default();
-    batch.put(file_key.as_bytes(), &file_bytes);
-    batch.put(res_key.as_bytes(), &res_bytes);
-    batch.put(site_key.as_bytes(), b"");
-
-    state
-        .db
-        .write(batch)
-        .map_err(|e| format!("RocksDB batch write error: {e}"))?;
-
-    // --- Meili: enqueue doc (batched) ---
     let content_type = resource
         .response_headers
         .get("content-type")
         .cloned()
         .or_else(|| resource.response_headers.get("Content-Type").cloned());
 
-    let doc = CacheIndexDoc {
+    let meili_doc = CacheIndexDoc {
         doc_id: meili_doc_id(&resource.resource_key),
-        website_key,
+        website_key: website_key.clone(),
         resource_key: resource.resource_key.clone(),
         url: resource.url.clone(),
         status: resource.status,
         content_type,
     };
 
-    enqueue_meili_doc(&state, doc);
+    Ok(PreparedEntry {
+        resource,
+        body,
+        file_id,
+        website_key,
+        meili_doc,
+    })
+}
 
+/// Commit one or more prepared entries in a single RocksDB WriteBatch.
+/// The RocksDB write is offloaded to `spawn_blocking` to avoid starving the
+/// async executor under high concurrency.
+async fn commit_entries(
+    state: &Arc<AppState>,
+    entries: Vec<PreparedEntry>,
+) -> Result<usize, String> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let count = entries.len();
+
+    // Pre-serialize everything needed for the WriteBatch.
+    let mut write_items: Vec<(Vec<u8>, Bytes, Vec<u8>, Vec<u8>, Vec<u8>)> =
+        Vec::with_capacity(count);
+    let mut mem_inserts: Vec<(String, ResourceWithBody)> = Vec::with_capacity(count);
+    let mut meili_docs: Vec<CacheIndexDoc> = Vec::with_capacity(count);
+
+    for entry in entries {
+        let res_bytes = serde_json::to_vec(&entry.resource)
+            .map_err(|e| format!("Serialize ResourceEntry error: {e}"))?;
+
+        write_items.push((
+            format!("file:{}", entry.file_id).into_bytes(),
+            entry.body.clone(),
+            format!("res:{}", entry.resource.resource_key).into_bytes(),
+            res_bytes,
+            format!("site:{}::{}", entry.website_key, entry.resource.resource_key).into_bytes(),
+        ));
+
+        mem_inserts.push((
+            entry.resource.resource_key.clone(),
+            ResourceWithBody {
+                resource: entry.resource,
+                body: entry.body,
+            },
+        ));
+
+        meili_docs.push(entry.meili_doc);
+    }
+
+    // Offload the blocking RocksDB write to the blocking thread pool.
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut batch = rocksdb::WriteBatch::default();
+        for (file_key, body, res_key, res_bytes, site_key) in &write_items {
+            batch.put(file_key, body.as_ref()); // raw bytes — no JSON wrapper
+            batch.put(res_key, res_bytes);
+            batch.put(site_key, b"");
+        }
+        db.write(batch)
+            .map_err(|e| format!("RocksDB batch write error: {e}"))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join error: {e}"))??;
+
+    // Update in-memory cache *after* successful RocksDB write.
+    for (key, value) in mem_inserts {
+        state.mem_resources.insert(key, value);
+    }
+
+    // Enqueue Meili docs (non-blocking, best-effort).
+    for doc in meili_docs {
+        enqueue_meili_doc(state, doc);
+    }
+
+    Ok(count)
+}
+
+/// Core logic to index a single entry (RocksDB + mem), then enqueue Meili doc (batched).
+async fn index_single_entry(
+    payload: Box<CachedEntryPayload>,
+    header_site_key: Option<String>,
+    state: Arc<AppState>,
+) -> Result<(), String> {
+    let prepared = prepare_entry(payload, header_site_key.as_deref())?;
+    commit_entries(&state, vec![prepared]).await?;
     Ok(())
 }
 
@@ -800,26 +903,10 @@ fn get_resource_with_body(
     let resource: ResourceEntry = serde_json::from_slice(&res_bytes)
         .map_err(|e| format!("Deserialize ResourceEntry error: {e}"))?;
 
-    let file_key = format!("file:{}", resource.file_id);
-    let file_pinned = state
-        .db
-        .get_pinned(file_key.as_bytes())
-        .map_err(|e| format!("RocksDB get file error: {e}"))?;
+    let body = load_file_body(&state.db, &resource.file_id)?
+        .ok_or_else(|| format!("FileEntry missing for file_id {}", resource.file_id))?;
 
-    let Some(file_bytes) = file_pinned else {
-        return Err(format!(
-            "FileEntry missing for file_id {}",
-            resource.file_id
-        ));
-    };
-
-    let file_entry: FileEntry = serde_json::from_slice(&file_bytes)
-        .map_err(|e| format!("Deserialize FileEntry error: {e}"))?;
-
-    let combined = ResourceWithBody {
-        resource,
-        body: Bytes::from(file_entry.body),
-    };
+    let combined = ResourceWithBody { resource, body };
 
     state
         .mem_resources
@@ -1101,17 +1188,28 @@ fn scan_empty_file_ids(state: &AppState, max_value_bytes: usize) -> Result<HashS
 
         scanned += 1;
 
-        let file_entry: FileEntry = match serde_json::from_slice(&value) {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Failed to deserialize FileEntry during purge scan: {e}");
-                continue;
-            }
+        // Extract file_id from key prefix "file:{file_id}"
+        let file_id = match std::str::from_utf8(&key[5..]) {
+            Ok(s) => s,
+            Err(_) => continue,
         };
 
-        if is_empty_html(&file_entry.body) {
-            info!("purge_empty: found empty file_id={} body_len={}", file_entry.file_id, file_entry.body.len());
-            empty_file_ids.insert(file_entry.file_id);
+        // Handle both storage formats: legacy JSON vs new raw bytes
+        let is_empty = if value.first() == Some(&b'{') {
+            match serde_json::from_slice::<FileEntry>(&value) {
+                Ok(f) => is_empty_html(&f.body),
+                Err(e) => {
+                    error!("Failed to deserialize FileEntry during purge scan: {e}");
+                    continue;
+                }
+            }
+        } else {
+            is_empty_html(&value)
+        };
+
+        if is_empty {
+            info!("purge_empty: found empty file_id={} body_len={}", file_id, value.len());
+            empty_file_ids.insert(file_id.to_string());
         }
     }
 
