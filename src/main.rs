@@ -19,7 +19,7 @@ use hyper_util::{
     server::conn::auto::Builder as AutoBuilder,
 };
 use meilisearch_sdk::client::Client as MeiliClient;
-use rocksdb::{Direction, IteratorMode, DB};
+use rocksdb::{Direction, IteratorMode, Options, DB};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing::{error, info, warn};
@@ -153,10 +153,11 @@ struct FileEntry {
 }
 
 /// In-memory combined view (resource + body).
+/// Uses `Bytes` for the body so clones are O(1) ref-count bumps.
 #[derive(Debug, Clone)]
 struct ResourceWithBody {
     resource: ResourceEntry,
-    body: Vec<u8>,
+    body: Bytes,
 }
 
 /// Represents an HTTP version
@@ -317,8 +318,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // ---- RocksDB ----
-    let db = Arc::new(DB::open_default("cache_db")?);
+    // ---- RocksDB (tuned for cache workload) ----
+    let mut db_opts = Options::default();
+    db_opts.create_if_missing(true);
+
+    // Bloom filter: eliminates ~99% of unnecessary disk reads on point lookups.
+    let mut block_opts = rocksdb::BlockBasedOptions::default();
+    block_opts.set_bloom_filter(10.0, false);
+    // 128 MB block cache (hot data stays in memory).
+    block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(128 * 1024 * 1024));
+    block_opts.set_cache_index_and_filter_blocks(true);
+    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    db_opts.set_block_based_table_factory(&block_opts);
+
+    // Write performance: larger memtable = fewer flushes.
+    db_opts.set_write_buffer_size(64 * 1024 * 1024); // 64 MB
+    db_opts.set_max_write_buffer_number(3);
+    db_opts.set_min_write_buffer_number_to_merge(1);
+
+    // Parallelism: use available cores for compaction.
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4);
+    db_opts.increase_parallelism(num_cpus);
+    db_opts.set_max_background_jobs(num_cpus.max(2));
+
+    // Pipelined writes: overlap WAL write with memtable insert.
+    db_opts.set_enable_pipelined_write(true);
+
+    // Level compaction tuning.
+    db_opts.set_level_compaction_dynamic_level_bytes(true);
+    db_opts.set_max_bytes_for_level_base(256 * 1024 * 1024);
+
+    // Compression: LZ4 for speed on all levels.
+    db_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+
+    let db = Arc::new(DB::open(&db_opts, "cache_db")?);
 
     // ---- Meilisearch ----
     let meili_host = std::env::var("MEILI_HOST").unwrap_or_else(|_| "http://127.0.0.1:7700".into());
@@ -385,8 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let listener = TcpListener::bind(addr).await?;
     loop {
-        let (stream, peer) = listener.accept().await?;
-        info!("Accepted connection from {}", peer);
+        let (stream, _peer) = listener.accept().await?;
 
         let io = TokioIo::new(stream);
         let state = state.clone();
@@ -569,7 +603,7 @@ async fn handle_resource_lookup(
             .map(|s| s.as_str())
             .unwrap_or("application/octet-stream");
 
-        let body = Full::from(Bytes::from(res.body))
+        let body = Full::from(res.body)
             .map_err(|never: Infallible| match never {})
             .boxed();
 
@@ -688,53 +722,41 @@ async fn index_single_entry(
         created_at: Some(now_unix_timestamp()),
     };
 
+    let body = Bytes::from(body_bytes);
+
     // --- In-memory cache ---
     state.mem_resources.insert(
         resource.resource_key.clone(),
         ResourceWithBody {
             resource: resource.clone(),
-            body: body_bytes.clone(),
+            body: body.clone(),
         },
     );
 
-    // --- RocksDB: file payload (dedup by file_id) ---
+    // --- RocksDB: atomic batch write (file + resource + site index) ---
     let file_key = format!("file:{}", file_id);
+    let file_entry = FileEntry {
+        file_id: file_id.clone(),
+        body: body.to_vec(),
+    };
+    let file_bytes = serde_json::to_vec(&file_entry)
+        .map_err(|e| format!("Serialize FileEntry error: {e}"))?;
 
-    if state
-        .db
-        .get(file_key.as_bytes())
-        .map_err(|e| format!("RocksDB get file error: {e}"))?
-        .is_none()
-    {
-        let file_entry = FileEntry {
-            file_id: file_id.clone(),
-            body: body_bytes,
-        };
-        let file_bytes = serde_json::to_vec(&file_entry)
-            .map_err(|e| format!("Serialize FileEntry error: {e}"))?;
-
-        state
-            .db
-            .put(file_key.as_bytes(), file_bytes)
-            .map_err(|e| format!("RocksDB put file error: {e}"))?;
-    }
-
-    // --- RocksDB: resource metadata ---
     let res_key = format!("res:{}", resource.resource_key);
     let res_bytes =
         serde_json::to_vec(&resource).map_err(|e| format!("Serialize ResourceEntry error: {e}"))?;
 
-    state
-        .db
-        .put(res_key.as_bytes(), res_bytes)
-        .map_err(|e| format!("RocksDB put resource error: {e}"))?;
-
-    // --- RocksDB: site index entry ---
     let site_key = format!("site:{}::{}", website_key, resource.resource_key);
+
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.put(file_key.as_bytes(), &file_bytes);
+    batch.put(res_key.as_bytes(), &res_bytes);
+    batch.put(site_key.as_bytes(), b"");
+
     state
         .db
-        .put(site_key.as_bytes(), b"")
-        .map_err(|e| format!("RocksDB put site index error: {e}"))?;
+        .write(batch)
+        .map_err(|e| format!("RocksDB batch write error: {e}"))?;
 
     // --- Meili: enqueue doc (batched) ---
     let content_type = resource
@@ -766,12 +788,12 @@ fn get_resource_with_body(
     }
 
     let res_key = format!("res:{}", resource_key);
-    let res_bytes_opt = state
+    let res_pinned = state
         .db
-        .get(res_key.as_bytes())
+        .get_pinned(res_key.as_bytes())
         .map_err(|e| format!("RocksDB get resource error: {e}"))?;
 
-    let Some(res_bytes) = res_bytes_opt else {
+    let Some(res_bytes) = res_pinned else {
         return Ok(None);
     };
 
@@ -779,12 +801,12 @@ fn get_resource_with_body(
         .map_err(|e| format!("Deserialize ResourceEntry error: {e}"))?;
 
     let file_key = format!("file:{}", resource.file_id);
-    let file_bytes_opt = state
+    let file_pinned = state
         .db
-        .get(file_key.as_bytes())
+        .get_pinned(file_key.as_bytes())
         .map_err(|e| format!("RocksDB get file error: {e}"))?;
 
-    let Some(file_bytes) = file_bytes_opt else {
+    let Some(file_bytes) = file_pinned else {
         return Err(format!(
             "FileEntry missing for file_id {}",
             resource.file_id
@@ -795,8 +817,8 @@ fn get_resource_with_body(
         .map_err(|e| format!("Deserialize FileEntry error: {e}"))?;
 
     let combined = ResourceWithBody {
-        resource: resource.clone(),
-        body: file_entry.body.clone(),
+        resource,
+        body: Bytes::from(file_entry.body),
     };
 
     state
@@ -816,7 +838,7 @@ fn resource_with_body_to_payload(res: &ResourceWithBody) -> CachedEntryPayload {
         request_headers: res.resource.request_headers.clone(),
         response_headers: res.resource.response_headers.clone(),
         http_version: res.resource.http_version,
-        body_base64: general_purpose::STANDARD.encode(&res.body),
+        body_base64: general_purpose::STANDARD.encode(res.body.as_ref()),
     }
 }
 
@@ -944,11 +966,15 @@ fn do_rocksdb_cleanup(
         }
     }
 
-    for file_id in &orphaned_file_ids {
-        let file_key = format!("file:{}", file_id);
-        if let Err(e) = state.db.delete(file_key.as_bytes()) {
-            error!("Failed to delete file entry {}: {}", file_id, e);
+    if !orphaned_file_ids.is_empty() {
+        let mut file_batch = rocksdb::WriteBatch::default();
+        for file_id in &orphaned_file_ids {
+            file_batch.delete(format!("file:{}", file_id).as_bytes());
         }
+        state
+            .db
+            .write(file_batch)
+            .map_err(|e| format!("RocksDB batch delete (files) error: {e}"))?;
     }
 
     Ok((expired_resource_keys, orphaned_file_ids))
@@ -1382,7 +1408,7 @@ mod tests {
 
         assert_eq!(res.resource.website_key, "example.com");
         assert_eq!(res.resource.resource_key, resource_key);
-        assert_eq!(res.body, body_bytes);
+        assert_eq!(res.body.as_ref(), body_bytes);
 
         let site_key = format!("site:{}::{}", "example.com", resource_key);
         assert!(state.db.get(site_key.as_bytes()).unwrap().is_some());

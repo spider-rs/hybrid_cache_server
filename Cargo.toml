@@ -1,6 +1,6 @@
 [package]
 name = "hybrid_cache_server"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 build = "build.rs"
 authors = ["j-mendez <jeff@spider.cloud>"]
