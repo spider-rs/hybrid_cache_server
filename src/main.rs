@@ -155,10 +155,13 @@ struct FileEntry {
 
 /// In-memory combined view (resource + body).
 /// Uses `Bytes` for the body so clones are O(1) ref-count bumps.
+/// `body_base64` is computed once on first access and cached.
 #[derive(Debug, Clone)]
 struct ResourceWithBody {
     resource: ResourceEntry,
     body: Bytes,
+    /// Pre-computed base64 of body — avoids re-encoding on every JSON response.
+    body_base64: String,
 }
 
 /// Represents an HTTP version
@@ -844,11 +847,13 @@ async fn commit_entries(
             format!("site:{}::{}", entry.website_key, entry.resource.resource_key).into_bytes(),
         ));
 
+        let body_base64 = general_purpose::STANDARD.encode(entry.body.as_ref());
         mem_inserts.push((
             entry.resource.resource_key.clone(),
             ResourceWithBody {
                 resource: entry.resource,
                 body: entry.body,
+                body_base64,
             },
         ));
 
@@ -918,7 +923,12 @@ fn get_resource_with_body(
     let body = load_file_body(&state.db, &resource.file_id)?
         .ok_or_else(|| format!("FileEntry missing for file_id {}", resource.file_id))?;
 
-    let combined = ResourceWithBody { resource, body };
+    let body_base64 = general_purpose::STANDARD.encode(body.as_ref());
+    let combined = ResourceWithBody {
+        resource,
+        body,
+        body_base64,
+    };
 
     state
         .mem_resources
@@ -937,7 +947,7 @@ fn resource_with_body_to_payload(res: &ResourceWithBody) -> CachedEntryPayload {
         request_headers: res.resource.request_headers.clone(),
         response_headers: res.resource.response_headers.clone(),
         http_version: res.resource.http_version,
-        body_base64: general_purpose::STANDARD.encode(res.body.as_ref()),
+        body_base64: res.body_base64.clone(),
     }
 }
 
