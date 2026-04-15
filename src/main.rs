@@ -13,10 +13,11 @@ use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use hyper::{body::Incoming, service::service_fn, Request, Response, StatusCode};
+use hyper::{body::Incoming, Request, Response, StatusCode};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
+    service::TowerToHyperService,
 };
 use meilisearch_sdk::client::Client as MeiliClient;
 use rocksdb::{Direction, IteratorMode, Options, DB};
@@ -445,13 +446,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let state = state.clone();
 
         tokio::spawn(async move {
-            let svc = service_fn(move |req: Request<Incoming>| {
+            let svc = tower::service_fn(move |req: Request<Incoming>| {
                 let state = state.clone();
                 async move { handle(req, state).await }
             });
 
+            // Wrap with gzip + brotli compression based on Accept-Encoding.
+            let svc = tower::ServiceBuilder::new()
+                .layer(
+                    tower_http::compression::CompressionLayer::new()
+                        .gzip(true)
+                        .br(true)
+                        .no_deflate()
+                        .no_zstd(),
+                )
+                .service(svc);
+
             if let Err(err) = AutoBuilder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
+                .serve_connection(io, TowerToHyperService::new(svc))
                 .await
             {
                 error!("Error serving connection: {:?}", err);

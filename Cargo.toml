@@ -1,6 +1,6 @@
 [package]
 name = "hybrid_cache_server"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 build = "build.rs"
 authors = ["j-mendez <jeff@spider.cloud>"]
@@ -13,7 +13,7 @@ license = "MIT"
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio", "service"] }
 http-body-util = "0.1"
 bytes = "1"
 rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
@@ -27,6 +27,9 @@ hex = "0.4"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+flate2 = "1.1.9"
+tower-http = { version = "0.6.8", features = ["compression-gzip", "compression-br"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 [build-dependencies]
 cc = "1"
