@@ -20,6 +20,8 @@ http-body-util = "0.1"
 http-body = "1"
 http = "1"
 bytes = "1"
+percent-encoding = "2"
+socket2 = { version = "0.6", features = ["all"] }
 rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
 meilisearch-sdk = "0.31"
 moka = { version = "0.12", features = ["sync"] }
@@ -45,6 +47,7 @@ cc = "1"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util", "io-util"] }
 
 [profile.release]
 lto = "fat"

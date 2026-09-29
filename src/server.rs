@@ -33,6 +33,13 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// Bytes of request and response buffers that may be held at once.
     pub budget: Arc<Semaphore>,
+    /// Budget for reservations up to `small_request_bytes`. Tokio's
+    /// semaphore is FIFO, so on a shared pool one large write waiting for
+    /// room would stall every small read and write queued behind it.
+    pub small_budget: Arc<Semaphore>,
+    /// Caps blocking-pool reads, so requests that time out cannot leave a
+    /// backlog of RocksDB work behind them.
+    pub blocking_reads: Arc<Semaphore>,
     pub meili: Option<Meili>,
     pub prometheus: Option<PrometheusHandle>,
 }
@@ -45,12 +52,28 @@ impl AppState {
         prometheus: Option<PrometheusHandle>,
     ) -> Self {
         let budget = Arc::new(Semaphore::new(cfg.max_inflight_bytes as usize));
+        let small_budget = Arc::new(Semaphore::new(cfg.max_inflight_small_bytes as usize));
+        let blocking_reads = Arc::new(Semaphore::new(cfg.max_blocking_reads));
         AppState {
             cfg,
             store: Arc::new(store),
             budget,
+            small_budget,
+            blocking_reads,
             meili,
             prometheus,
+        }
+    }
+}
+
+impl AppState {
+    /// The budget a reservation of `n` bytes draws from.
+    pub fn pool_for(&self, n: u32) -> Arc<Semaphore> {
+        let n = n as u64;
+        if n <= self.cfg.small_request_bytes && n <= self.cfg.max_inflight_small_bytes {
+            self.small_budget.clone()
+        } else {
+            self.budget.clone()
         }
     }
 }
@@ -231,7 +254,12 @@ where
 {
     let started = Instant::now();
     let route = route_of(req.method(), req.uri().path());
-    let timeout = state.cfg.request_timeout;
+    // Uploads get the longer deadline: a 100 MiB batch from a slow client
+    // must not be cut off at the read deadline.
+    let timeout = match route {
+        "index" | "index_batch" => state.cfg.upload_timeout,
+        _ => state.cfg.request_timeout,
+    };
     let resp = match tokio::time::timeout(timeout, dispatch(req, state, route)).await {
         Ok(r) => r,
         Err(_) => text_response(StatusCode::SERVICE_UNAVAILABLE, "Request timed out"),
@@ -274,6 +302,19 @@ where
 
 fn last_segment(path: &str) -> String {
     path.rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// The path segment percent-decoded once, or None when decoding changes
+/// nothing, fails, or yields invalid UTF-8. browser_server sends
+/// `urlencoding::encode("GET:" + url)`; older clients send raw keys.
+pub fn decoded_segment(seg: &str) -> Option<String> {
+    if !seg.contains('%') {
+        return None;
+    }
+    match percent_encoding::percent_decode_str(seg).decode_utf8() {
+        Ok(d) if d != seg => Some(d.into_owned()),
+        _ => None,
+    }
 }
 
 fn wants_raw(query: &str) -> bool {
@@ -325,7 +366,7 @@ where
     }
     let reserve = write_reservation(declared.unwrap_or(max), &state.cfg);
     let wait = Instant::now();
-    let permit = match state.budget.clone().acquire_many_owned(reserve).await {
+    let permit = match state.pool_for(reserve).acquire_many_owned(reserve).await {
         Ok(p) => p,
         Err(_) => {
             return Err(text_response(
@@ -500,31 +541,75 @@ where
 /// Bodies at most this big are encoded on the async worker on a mem hit.
 const INLINE_ENCODE_MAX: usize = 64 * 1024;
 
-async fn handle_resource(state: Arc<AppState>, key: String, raw: bool) -> Response<ChunkedBody> {
+/// GET /cache/resource/{key}. The key is looked up percent-decoded first,
+/// then as sent, so both encoded and raw keys resolve.
+async fn handle_resource(state: Arc<AppState>, seg: String, raw: bool) -> Response<ChunkedBody> {
+    let mut candidates: Vec<String> = decoded_segment(&seg).into_iter().collect();
+    candidates.push(seg);
+    let mut found = None;
+    for key in candidates {
+        match lookup_resource(&state, key).await {
+            Ok(Some(r)) => {
+                found = Some(r);
+                break;
+            }
+            Ok(None) => {}
+            Err(resp) => return resp,
+        }
+    }
+    let Some(r) = found else {
+        return text_response(StatusCode::NOT_FOUND, "Resource not found");
+    };
+    resource_response(&state, r, raw).await
+}
+
+async fn lookup_resource(
+    state: &Arc<AppState>,
+    key: String,
+) -> Result<Option<Arc<crate::model::CachedResource>>, Response<ChunkedBody>> {
     // A mem cache hit needs no blocking thread; a miss reads RocksDB on one.
-    let r = match state.store.get_cached(&key) {
+    Ok(Some(match state.store.get_cached(&key) {
         Some(hit) => hit,
         None => {
             let st = state.clone();
+            let Ok(slot) = state.blocking_reads.clone().acquire_owned().await else {
+                return Err(text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Shutting down",
+                ));
+            };
             match tokio::task::spawn_blocking(move || {
+                let _slot = slot;
                 st.store.get_resource(&key, true).map_err(|e| (key, e))
             })
             .await
             {
                 Ok(Ok(Some(r))) => r,
-                Ok(Ok(None)) => return text_response(StatusCode::NOT_FOUND, "Resource not found"),
+                Ok(Ok(None)) => return Ok(None),
                 Ok(Err((key, e))) => {
                     error!("lookup of {key} failed: {e}");
-                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, "Lookup error");
+                    return Err(text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Lookup error",
+                    ));
                 }
                 Err(e) => {
                     error!("lookup task failed: {e}");
-                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, "Lookup error");
+                    return Err(text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Lookup error",
+                    ));
                 }
             }
         }
-    };
+    }))
+}
 
+async fn resource_response(
+    state: &Arc<AppState>,
+    r: Arc<crate::model::CachedResource>,
+    raw: bool,
+) -> Response<ChunkedBody> {
     if raw {
         // A stored Content-Type that is not a valid header value falls back
         // to octet-stream instead of failing the request.
@@ -543,16 +628,22 @@ async fn handle_resource(state: Arc<AppState>, key: String, raw: bool) -> Respon
     let reserve = (size as u64)
         .min(state.cfg.max_inflight_bytes)
         .min(u32::MAX as u64) as u32;
-    let Ok(permit) = state.budget.clone().acquire_many_owned(reserve).await else {
+    let Ok(permit) = state.pool_for(reserve).acquire_many_owned(reserve).await else {
         return text_response(StatusCode::SERVICE_UNAVAILABLE, "Shutting down");
     };
     let encoded = if r.body.len() <= INLINE_ENCODE_MAX {
         encode_payload(&r.resource, &r.body)
     } else {
         let r2 = r.clone();
-        tokio::task::spawn_blocking(move || encode_payload(&r2.resource, &r2.body))
-            .await
-            .unwrap_or_else(|e| Err(format!("encode task failed: {e}")))
+        let Ok(slot) = state.blocking_reads.clone().acquire_owned().await else {
+            return text_response(StatusCode::SERVICE_UNAVAILABLE, "Shutting down");
+        };
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            encode_payload(&r2.resource, &r2.body)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("encode task failed: {e}")))
     };
     match encoded {
         Ok(json) => json_response(
@@ -566,9 +657,26 @@ async fn handle_resource(state: Arc<AppState>, key: String, raw: bool) -> Respon
     }
 }
 
-async fn handle_site(state: Arc<AppState>, website_key: String) -> Response<ChunkedBody> {
+/// GET /cache/site/{key}. Like the resource route, a percent-encoded key is
+/// tried decoded first. chromey's 64-hex keys contain no '%', so for them
+/// this is exactly the old lookup.
+async fn handle_site(state: Arc<AppState>, seg: String) -> Response<ChunkedBody> {
+    if let Some(decoded) = decoded_segment(&seg) {
+        let resp = site_lookup(state.clone(), decoded).await;
+        if resp.status() != StatusCode::OK || resp.body().size_hint().exact() != Some(2) {
+            return resp; // found items, or an error
+        }
+    }
+    site_lookup(state, seg).await
+}
+
+async fn site_lookup(state: Arc<AppState>, website_key: String) -> Response<ChunkedBody> {
     let st = state.clone();
+    let Ok(slot) = state.blocking_reads.clone().acquire_owned().await else {
+        return text_response(StatusCode::SERVICE_UNAVAILABLE, "Shutting down");
+    };
     let joined = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         st.store.build_site_response(
             &website_key,
             st.cfg.max_site_response_bytes as usize,

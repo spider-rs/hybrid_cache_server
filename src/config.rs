@@ -14,8 +14,24 @@ pub struct Config {
     pub max_inflight_bytes: u64,
     /// Largest /cache/site response. Items past it are left out.
     pub max_site_response_bytes: u64,
+    /// Deadline for GET and purge requests.
     pub request_timeout: Duration,
+    /// Deadline for POST /cache/index*, which includes the upload.
+    pub upload_timeout: Duration,
     pub header_read_timeout: Duration,
+    /// A connection whose peer accepts no bytes for this long is closed, so
+    /// a stalled reader cannot hold response buffers.
+    pub write_idle_timeout: Duration,
+    /// TCP keepalive idle time and TCP_USER_TIMEOUT (Linux) on accepted sockets.
+    pub tcp_timeout: Duration,
+    /// Reservations up to this size come from the small pool.
+    pub small_request_bytes: u64,
+    /// Separate budget for small reservations, so they never queue behind a
+    /// large write waiting on the main budget.
+    pub max_inflight_small_bytes: u64,
+    /// Blocking-pool tasks for reads (mem cache misses, site scans, large
+    /// encodes) at once.
+    pub max_blocking_reads: usize,
     /// Byte budget of the in-memory resource cache.
     pub mem_cache_bytes: u64,
     pub rocksdb_path: String,
@@ -103,10 +119,18 @@ impl Config {
                 .and_then(|p| p.trim().parse().ok())
                 .unwrap_or(8080),
             max_connections: env_u64("MAX_CONNECTIONS", 10_000).max(1) as usize,
-            max_body_bytes: env_u64("MAX_BODY_BYTES", 96 * MIB).max(1024),
+            // The fleet's largest request is 16 bodies of 5 MiB as base64
+            // JSON, about 107 MiB, which v0.2 accepted.
+            max_body_bytes: env_u64("MAX_BODY_BYTES", 160 * MIB).max(1024),
             max_inflight_bytes: env_u64("MAX_INFLIGHT_BYTES", 1024 * MIB).max(MIB),
             max_site_response_bytes: env_u64("MAX_SITE_RESPONSE_BYTES", 64 * MIB).max(1024),
             request_timeout: Duration::from_secs(env_u64("REQUEST_TIMEOUT_SECS", 30).max(1)),
+            upload_timeout: Duration::from_secs(env_u64("UPLOAD_TIMEOUT_SECS", 120).max(1)),
+            write_idle_timeout: Duration::from_secs(env_u64("WRITE_IDLE_TIMEOUT_SECS", 30).max(1)),
+            tcp_timeout: Duration::from_secs(env_u64("TCP_TIMEOUT_SECS", 30).max(1)),
+            small_request_bytes: env_u64("SMALL_REQUEST_BYTES", 8 * MIB),
+            max_inflight_small_bytes: env_u64("MAX_INFLIGHT_SMALL_BYTES", 128 * MIB).max(MIB),
+            max_blocking_reads: env_u64("MAX_BLOCKING_READS", 64).max(1) as usize,
             header_read_timeout: Duration::from_secs(
                 env_u64("HEADER_READ_TIMEOUT_SECS", 120).max(1),
             ),
@@ -141,10 +165,16 @@ impl Config {
         Config {
             port: 0,
             max_connections: 100,
-            max_body_bytes: 96 * MIB,
+            max_body_bytes: 160 * MIB,
             max_inflight_bytes: 1024 * MIB,
             max_site_response_bytes: 64 * MIB,
             request_timeout: Duration::from_secs(30),
+            upload_timeout: Duration::from_secs(120),
+            write_idle_timeout: Duration::from_secs(30),
+            tcp_timeout: Duration::from_secs(30),
+            small_request_bytes: 8 * MIB,
+            max_inflight_small_bytes: 128 * MIB,
+            max_blocking_reads: 64,
             header_read_timeout: Duration::from_secs(120),
             mem_cache_bytes: 64 * MIB,
             rocksdb_path: path.to_string(),

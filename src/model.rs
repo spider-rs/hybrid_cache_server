@@ -100,6 +100,9 @@ pub struct CachedEntryPayload {
     pub body_base64: String,
     #[serde(default)]
     pub http_version: HttpVersion,
+    /// Returned by the lookup routes; ignored on writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 /// Same shape as [`CachedEntryPayload`], parsed from the request buffer.
@@ -143,6 +146,10 @@ struct PayloadMeta<'a> {
     request_headers: &'a HashMap<String, String>,
     response_headers: &'a HashMap<String, String>,
     http_version: HttpVersion,
+    /// Unix seconds when the resource was stored. Absent for entries
+    /// written before created_at existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<i64>,
 }
 
 const B64_PREFIX: &[u8] = b"{\"body_base64\":\"";
@@ -165,6 +172,7 @@ impl PayloadEncoder {
             request_headers: &resource.request_headers,
             response_headers: &resource.response_headers,
             http_version: resource.http_version,
+            created_at: resource.created_at,
         })
         .map_err(|e| format!("serialize payload meta: {e}"))?;
         Ok(Self { meta, body_len })

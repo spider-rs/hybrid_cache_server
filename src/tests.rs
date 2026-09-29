@@ -48,6 +48,7 @@ fn payload(site: Option<&str>, key: &str, url: &str, body: &[u8]) -> CachedEntry
         response_headers: resp_headers,
         body_base64: STANDARD.encode(body),
         http_version: HttpVersion::Http11,
+        created_at: None,
     }
 }
 
@@ -291,7 +292,7 @@ async fn single_index_header_still_wins() {
 }
 
 #[tokio::test]
-async fn overwrite_with_new_site_moves_index_key() {
+async fn overwrite_with_new_site_keeps_old_index_key() {
     let t = env();
     index_one(
         &t.state,
@@ -305,8 +306,283 @@ async fn overwrite_with_new_site_moves_index_key() {
         None,
     )
     .await;
-    assert!(site_items(&t.state, "old.com").await.is_empty());
-    assert_eq!(site_items(&t.state, "new.com").await.len(), 1);
+    // Add-only: both sites list the resource, with its latest body.
+    for site in ["old.com", "new.com"] {
+        let items = site_items(&t.state, site).await;
+        assert_eq!(items.len(), 1, "{site}");
+        assert_eq!(STANDARD.decode(&items[0].body_base64).unwrap(), b"v2");
+    }
+}
+
+/// The sequence the fleet produces with spider_remote_cache 0.3/0.4: a single
+/// dump files the resource under the crawl's site key from the header, then
+/// a batch re-dump of the same resource carries website_key = URL host. The
+/// resource must stay listed under the header's site key.
+#[tokio::test]
+async fn batch_redump_keeps_resource_under_single_dump_site() {
+    let t = env();
+    let site_hash = "a1b2c3site";
+    index_one(
+        &t.state,
+        &payload(Some("example.com"), "rk", "https://example.com/p", b"first"),
+        Some(site_hash),
+    )
+    .await;
+    assert_eq!(site_items(&t.state, site_hash).await.len(), 1);
+
+    let batch = vec![payload(
+        Some("example.com"),
+        "rk",
+        "https://example.com/p",
+        b"second",
+    )];
+    let (s, _, _) = call(
+        &t.state,
+        post(
+            "/cache/index/batch",
+            Some("example.com"),
+            serde_json::to_vec(&batch).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let items = site_items(&t.state, site_hash).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "batch re-dump dropped the resource from the crawl's site"
+    );
+    assert_eq!(STANDARD.decode(&items[0].body_base64).unwrap(), b"second");
+    assert_eq!(site_items(&t.state, "example.com").await.len(), 1);
+}
+
+#[tokio::test]
+async fn missing_body_is_a_miss_not_an_error() {
+    let t = env();
+    index_one(
+        &t.state,
+        &payload(Some("a"), "gone", "https://a/gone", b"body"),
+        None,
+    )
+    .await;
+    t.state.store.mem.invalidate_all();
+    t.state.store.mem.run_pending_tasks();
+    let fid = compute_file_id(b"body");
+    t.state.store.db.delete(format!("file:{fid}")).unwrap();
+    let (s, _, _) = call(&t.state, get("/cache/resource/gone")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn read_fill_does_not_replace_a_newer_cached_entry() {
+    let t = env();
+    let store = &t.state.store;
+    index_one(
+        &t.state,
+        &payload(Some("a"), "k", "https://a/k", b"old"),
+        None,
+    )
+    .await;
+    store.mem.invalidate_all();
+    store.mem.run_pending_tasks();
+    // A newer version lands in the mem cache (as commit() does) while the
+    // disk still holds the old one; the read must not overwrite it.
+    let newer = Arc::new(crate::model::CachedResource {
+        resource: store
+            .get_resource("k", false)
+            .unwrap()
+            .unwrap()
+            .resource
+            .clone(),
+        body: Bytes::from_static(b"newer"),
+    });
+    store.mem.insert("k".to_string(), newer);
+    store.mem.invalidate("k"); // force the miss path below...
+    store.mem.run_pending_tasks();
+    let loaded = store.get_resource("k", true).unwrap().unwrap();
+    assert_eq!(&loaded.body[..], b"old");
+    // ...and with the newer entry present, a fill keeps it.
+    let newer = Arc::new(crate::model::CachedResource {
+        resource: loaded.resource.clone(),
+        body: Bytes::from_static(b"newer"),
+    });
+    store.mem.insert("k".to_string(), newer);
+    let got = store
+        .mem
+        .entry("k".to_string())
+        .or_insert(loaded)
+        .into_value();
+    assert_eq!(&got.body[..], b"newer");
+}
+
+// ---------------------------------------------------------------- path decoding
+
+/// Percent-encode everything but unreserved characters, like the
+/// `urlencoding` crate browser_server uses.
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn encoded_resource_key_resolves_to_raw_key() {
+    let t = env();
+    let key = "GET:https://example.com/a/b?q=1 2";
+    index_one(
+        &t.state,
+        &payload(
+            Some("example.com"),
+            key,
+            "https://example.com/a/b",
+            b"hello",
+        ),
+        None,
+    )
+    .await;
+    let path = format!("/cache/resource/{}", urlencode(key));
+    let (s, _, b) = call(&t.state, get(&path)).await;
+    assert_eq!(s, StatusCode::OK, "{path}");
+    let got: CachedEntryPayload = serde_json::from_slice(&b).unwrap();
+    assert_eq!(got.resource_key, key);
+    let (s, _, raw) = call(&t.state, get(&format!("{path}?raw=1"))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(&raw[..], b"hello");
+}
+
+#[tokio::test]
+async fn raw_keys_still_resolve() {
+    let t = env();
+    // No percent at all.
+    index_one(
+        &t.state,
+        &payload(Some("a"), "plainkey123", "https://a/", b"x"),
+        None,
+    )
+    .await;
+    let (s, _, _) = call(&t.state, get("/cache/resource/plainkey123")).await;
+    assert_eq!(s, StatusCode::OK);
+    // A stored key that itself contains '%' is still found as sent.
+    index_one(
+        &t.state,
+        &payload(Some("a"), "k%41", "https://a/", b"y"),
+        None,
+    )
+    .await;
+    let (s, _, b) = call(&t.state, get("/cache/resource/k%41")).await;
+    assert_eq!(s, StatusCode::OK);
+    let got: CachedEntryPayload = serde_json::from_slice(&b).unwrap();
+    assert_eq!(got.resource_key, "k%41");
+    // Invalid encodings fall back to the raw segment.
+    index_one(
+        &t.state,
+        &payload(Some("a"), "bad%ZZ%FF", "https://a/", b"z"),
+        None,
+    )
+    .await;
+    let (s, _, _) = call(&t.state, get("/cache/resource/bad%ZZ%FF")).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn site_key_decoding_is_a_no_op_for_hex() {
+    let t = env();
+    let hex = "a".repeat(64);
+    index_one(
+        &t.state,
+        &payload(None, "r1", "https://x/", b"x"),
+        Some(&hex),
+    )
+    .await;
+    assert_eq!(site_items(&t.state, &hex).await.len(), 1);
+    assert!(crate::server::decoded_segment(&hex).is_none());
+    // An encoded site key resolves too.
+    index_one(
+        &t.state,
+        &payload(None, "r2", "https://x/", b"y"),
+        Some("my site"),
+    )
+    .await;
+    assert_eq!(site_items(&t.state, "my%20site").await.len(), 1);
+}
+
+#[tokio::test]
+async fn payload_carries_created_at() {
+    let t = env();
+    index_one(
+        &t.state,
+        &payload(Some("a"), "c1", "https://a/", b"x"),
+        None,
+    )
+    .await;
+    let (_, _, b) = call(&t.state, get("/cache/resource/c1")).await;
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let ts = v["created_at"].as_i64().expect("created_at present");
+    assert!((now - ts).abs() < 60);
+    let items = site_items(&t.state, "a").await;
+    assert!(items[0].created_at.is_some());
+
+    // A legacy entry without created_at omits the field.
+    let mut e: ResourceEntry =
+        serde_json::from_slice(&t.state.store.db.get(b"res:c1").unwrap().unwrap()).unwrap();
+    e.created_at = None;
+    let enc = crate::model::encode_payload(&e, b"x").unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&enc).unwrap();
+    assert!(v.get("created_at").is_none());
+}
+
+#[tokio::test]
+async fn small_requests_do_not_queue_behind_a_large_reservation() {
+    let t = env_with(|c| c.request_timeout = std::time::Duration::from_secs(2));
+    index_one(
+        &t.state,
+        &payload(Some("a"), "small", "https://a/", b"tiny"),
+        None,
+    )
+    .await;
+    // A large write holds, and another waits for, the whole main budget.
+    let all = t.state.cfg.max_inflight_bytes as u32;
+    let held = t
+        .state
+        .budget
+        .clone()
+        .acquire_many_owned(all)
+        .await
+        .unwrap();
+    let waiter = {
+        let b = t.state.budget.clone();
+        tokio::spawn(async move { b.acquire_many_owned(all).await.map(drop) })
+    };
+    tokio::task::yield_now().await;
+    // Small reads and writes still go through.
+    let (s, _, _) = call(&t.state, get("/cache/resource/small")).await;
+    assert_eq!(s, StatusCode::OK);
+    index_one(
+        &t.state,
+        &payload(Some("a"), "small2", "https://a/", b"tiny2"),
+        None,
+    )
+    .await;
+    drop(held);
+    waiter.await.unwrap().unwrap();
+}
+
+#[test]
+fn default_body_limit_fits_the_largest_fleet_batch() {
+    // 16 bodies of 5 MiB as base64 JSON is about 107 MiB.
+    let cfg = Config::from_env();
+    assert!(cfg.max_body_bytes >= 107 * 1024 * 1024);
+    assert!(cfg.upload_timeout >= std::time::Duration::from_secs(120));
 }
 
 // ---------------------------------------------------------------- batch failures

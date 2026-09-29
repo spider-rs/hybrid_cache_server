@@ -5,6 +5,7 @@
 mod config;
 mod meili;
 mod model;
+mod netio;
 mod server;
 mod store;
 mod telemetry;
@@ -42,8 +43,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static _rjem_malloc_conf: &[u8] =
-    b"background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0\0";
+pub static _rjem_malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 /// macOS jemalloc has no background threads; purging happens on the
 /// allocating threads instead.
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 continue;
             }
         };
-        let _ = stream.set_nodelay(true);
+        netio::tune_socket(&stream, cfg.tcp_timeout);
         let Ok(permit) = conns.clone().acquire_owned().await else {
             continue;
         };
@@ -123,7 +123,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             builder.http2().timer(TokioTimer::new());
 
             if let Err(err) = builder
-                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(svc))
+                .serve_connection(
+                    TokioIo::new(netio::WriteIdleTimeout::new(
+                        stream,
+                        state.cfg.write_idle_timeout,
+                    )),
+                    TowerToHyperService::new(svc),
+                )
                 .await
             {
                 if is_benign(&*err) {

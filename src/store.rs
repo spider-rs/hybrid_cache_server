@@ -322,9 +322,15 @@ impl Store {
         let Some(resource) = self.read_resource_entry(resource_key)? else {
             return Ok(None);
         };
-        let body = self
-            .read_body(&resource.file_id)?
-            .ok_or_else(|| format!("file body missing for file_id {}", resource.file_id))?;
+        // The body can vanish between the two reads if cleanup removes the
+        // resource meanwhile. That is a miss, not a server error.
+        let Some(body) = self.read_body(&resource.file_id)? else {
+            warn!(
+                "resource {resource_key}: body {} missing, treating as a miss",
+                resource.file_id
+            );
+            return Ok(None);
+        };
         Ok(Some(Arc::new(CachedResource { resource, body })))
     }
 
@@ -350,8 +356,11 @@ impl Store {
         metrics::counter!(tm::MEM_MISSES).increment(1);
         let loaded = self.load_from_db(resource_key)?;
         if fill {
-            if let Some(r) = &loaded {
-                self.mem.insert(resource_key.to_string(), r.clone());
+            if let Some(r) = loaded {
+                // Insert only if absent: a write that committed after our
+                // read has already put the newer version here, and it wins.
+                let entry = self.mem.entry(resource_key.to_string()).or_insert(r);
+                return Ok(Some(entry.into_value()));
             }
         }
         Ok(loaded)
@@ -524,9 +533,9 @@ impl Store {
             }
 
             let mut files_in_batch: HashSet<&str> = HashSet::new();
-            // Resource key -> (file_id, website_key) of its previous version,
-            // including earlier items of this same batch.
-            let mut previous: HashMap<&str, (String, String)> = HashMap::new();
+            // Resource key -> file_id of its previous version, including
+            // earlier items of this same batch.
+            let mut previous: HashMap<&str, String> = HashMap::new();
 
             for e in &entries {
                 let r = &e.resource;
@@ -546,21 +555,26 @@ impl Store {
                     None => match timed(tm::DB_READ, || self.db.get_pinned(res_key.as_bytes())) {
                         Ok(Some(raw)) => serde_json::from_slice::<ResourceMeta>(&raw)
                             .ok()
-                            .map(|m| (m.file_id.into_owned(), m.website_key.into_owned())),
+                            .map(|m| m.file_id.into_owned()),
                         Ok(None) => None,
                         Err(e) => return Err(format!("rocksdb get resource: {e}")),
                     },
                 };
-                if let Some((old_file, old_site)) = prev {
+                if let Some(old_file) = prev {
                     if old_file != r.file_id {
                         // The old body may now be unreferenced; let GC decide.
                         batch.put(format!("orph:{old_file}").as_bytes(), b"");
                     }
-                    if old_site != r.website_key {
-                        batch.delete(format!("site:{old_site}::{}", r.resource_key).as_bytes());
-                    }
                 }
-                previous.insert(&r.resource_key, (r.file_id.clone(), r.website_key.clone()));
+                // Site index keys are add-only. When an overwrite files the
+                // resource under a different site, the old site keeps its
+                // key too. Current clients depend on this: a single dump
+                // files a resource under the crawl's site key (header), and
+                // a later batch dump of the same resource carries the URL
+                // host, so deleting the old key would drop the resource from
+                // the site the crawler reads. A site key whose resource is
+                // gone is removed lazily by the next site lookup.
+                previous.insert(&r.resource_key, r.file_id.clone());
 
                 let res_bytes =
                     serde_json::to_vec(r).map_err(|e| format!("serialize ResourceEntry: {e}"))?;
