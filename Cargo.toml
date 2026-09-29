@@ -39,6 +39,13 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
+# On Linux the jemalloc feature builds jemalloc with unprefixed symbols, so
+# RocksDB's C++ allocations (block cache, memtables, compaction buffers) go
+# through the same jemalloc as Rust instead of glibc malloc, which kept
+# freed memory. It is one jemalloc: this and tikv-jemallocator share one
+# tikv-jemalloc-sys. On macOS jemalloc stays prefixed and RocksDB keeps the
+# system allocator.
+rocksdb = { version = "0.24", features = ["jemalloc"] }
 tikv-jemallocator = { version = "0.6", features = ["stats"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
