@@ -30,5 +30,9 @@ for _ in $(seq 1 100); do
 done
 echo "[run] $BIN pid=$PID port=$PORT db=$DIR"
 "$LOADGEN" url="http://127.0.0.1:$PORT" pid="$PID" "$@"
+if curl -fsS "http://127.0.0.1:$PORT/metrics" -o "$DIR/metrics.txt" 2>/dev/null; then
+  echo "[run] server memory gauges at the end:"
+  grep -E '^(jemalloc_|mem_cache_bytes|mem_cache_entries|inflight_budget_available)' "$DIR/metrics.txt" || true
+fi
 echo "[run] server log tail:"
 tail -n 5 "$DIR/server.log" || true
