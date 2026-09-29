@@ -54,11 +54,13 @@ Every setting is an environment variable. `start.sh` passes the environment thro
 
 ### Building for production (aarch64 Graviton3)
 
+On the Graviton box:
+
 ```bash
 RUSTFLAGS="-C target-cpu=neoverse-v1" cargo build --release
-# or from a Mac:
-RUSTFLAGS="-C target-cpu=neoverse-v1" cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.26
 ```
+
+From a Mac, `scripts/build-aarch64.sh` cross-builds with cargo-zigbuild. The binary needs glibc 2.25 or newer and no libstdc++.
 
 `target-cpu=neoverse-v1` is for Graviton3 only. Leave `RUSTFLAGS` unset for any other machine.
 
