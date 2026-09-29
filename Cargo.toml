@@ -1,6 +1,6 @@
 [package]
 name = "hybrid_cache_server"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 build = "build.rs"
 authors = ["j-mendez <jeff@spider.cloud>"]
@@ -9,16 +9,20 @@ keywords = ["cache", "indexing"]
 categories = ["web-programming", "command-line-utilities"]
 description = "A hybrid cache server with indexing."
 license = "MIT"
+autobenches = false
+exclude = ["benches/loadgen/*", "target*"]
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio", "service"] }
 http-body-util = "0.1"
+http-body = "1"
+http = "1"
 bytes = "1"
 rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
 meilisearch-sdk = "0.31"
-dashmap = "6"
+moka = { version = "0.12", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -27,12 +31,25 @@ hex = "0.4"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-flate2 = "1.1.9"
-tower-http = { version = "0.6.8", features = ["compression-gzip", "compression-br"] }
+tower-http = { version = "0.6.8", features = ["compression-gzip", "compression-br", "compression-zstd"] }
 tower = { version = "0.5.3", features = ["util"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
 
 [build-dependencies]
 cc = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# panic stays "unwind": hyper runs every connection in its own task, and an
+# unwinding panic there drops one connection. With "abort" the same panic
+# would take down the whole cache for the fleet, which is the outage class
+# this release exists to remove.
+panic = "unwind"
