@@ -7,3 +7,5 @@ dumps
 # meilisearch
 meili_data
 meili_dumps
+/target-v023
+benches/loadgen/target
