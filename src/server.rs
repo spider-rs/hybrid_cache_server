@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{header, HeaderMap, Request, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
@@ -336,24 +336,33 @@ where
     };
     metrics::histogram!(tm::INFLIGHT_WAIT).record(wait.elapsed().as_secs_f64());
 
-    match Limited::new(body, max as usize).collect().await {
-        Ok(c) => {
-            let bytes = c.to_bytes();
-            metrics::counter!(tm::HTTP_REQ_BYTES).increment(bytes.len() as u64);
-            Ok((bytes, permit))
-        }
-        Err(e) => {
-            if e.downcast_ref::<LengthLimitError>().is_some() {
-                Err(text_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Body too large",
-                ))
-            } else {
-                tracing::debug!("failed to read request body: {e}");
-                Err(text_response(StatusCode::BAD_REQUEST, "Invalid body"))
+    // Copy frames into one buffer sized from Content-Length as they
+    // arrive. Collecting frames and then concatenating them would hold the
+    // body twice at the peak.
+    let mut limited = std::pin::pin!(Limited::new(body, max as usize));
+    let mut buf = BytesMut::with_capacity(declared.unwrap_or(0).min(max) as usize);
+    while let Some(frame) = limited.as_mut().frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(d) = f.into_data() {
+                    buf.extend_from_slice(&d);
+                }
+            }
+            Err(e) => {
+                return if e.downcast_ref::<LengthLimitError>().is_some() {
+                    Err(text_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Body too large",
+                    ))
+                } else {
+                    tracing::debug!("failed to read request body: {e}");
+                    Err(text_response(StatusCode::BAD_REQUEST, "Invalid body"))
+                };
             }
         }
     }
+    metrics::counter!(tm::HTTP_REQ_BYTES).increment(buf.len() as u64);
+    Ok((buf.freeze(), permit))
 }
 
 enum PutOutcome {
@@ -492,41 +501,30 @@ where
 const INLINE_ENCODE_MAX: usize = 64 * 1024;
 
 async fn handle_resource(state: Arc<AppState>, key: String, raw: bool) -> Response<ChunkedBody> {
-    // Fast path: a small mem cache hit needs no blocking thread.
-    if let Some(hit) = state.store.get_cached(&key) {
-        if raw || hit.body.len() <= INLINE_ENCODE_MAX {
-            return resource_response(&state, &hit, raw);
+    // A mem cache hit needs no blocking thread; a miss reads RocksDB on one.
+    let r = match state.store.get_cached(&key) {
+        Some(hit) => hit,
+        None => {
+            let st = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                st.store.get_resource(&key, true).map_err(|e| (key, e))
+            })
+            .await
+            {
+                Ok(Ok(Some(r))) => r,
+                Ok(Ok(None)) => return text_response(StatusCode::NOT_FOUND, "Resource not found"),
+                Ok(Err((key, e))) => {
+                    error!("lookup of {key} failed: {e}");
+                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, "Lookup error");
+                }
+                Err(e) => {
+                    error!("lookup task failed: {e}");
+                    return text_response(StatusCode::INTERNAL_SERVER_ERROR, "Lookup error");
+                }
+            }
         }
-    }
-    let st = state.clone();
-    let joined = tokio::task::spawn_blocking(move || {
-        let res = st.store.get_resource(&key, true);
-        match res {
-            Ok(Some(r)) => Ok(Some(resource_response(&st, &r, raw))),
-            Ok(None) => Ok(None),
-            Err(e) => Err((key, e)),
-        }
-    })
-    .await;
-    match joined {
-        Ok(Ok(Some(resp))) => resp,
-        Ok(Ok(None)) => text_response(StatusCode::NOT_FOUND, "Resource not found"),
-        Ok(Err((key, e))) => {
-            error!("lookup of {key} failed: {e}");
-            text_response(StatusCode::INTERNAL_SERVER_ERROR, "Lookup error")
-        }
-        Err(e) => {
-            error!("lookup task failed: {e}");
-            text_response(StatusCode::INTERNAL_SERVER_ERROR, "Lookup error")
-        }
-    }
-}
+    };
 
-fn resource_response(
-    state: &AppState,
-    r: &crate::model::CachedResource,
-    raw: bool,
-) -> Response<ChunkedBody> {
     if raw {
         // A stored Content-Type that is not a valid header value falls back
         // to octet-stream instead of failing the request.
@@ -539,16 +537,24 @@ fn resource_response(
         resp.headers_mut().insert(header::CONTENT_TYPE, ct);
         return resp;
     }
+
+    // Wait for room for the JSON copy. The request timeout bounds the wait.
     let size = crate::model::base64_len(r.body.len()) + 1024;
-    let permit = match state
-        .budget
-        .clone()
-        .try_acquire_many_owned(size.min(u32::MAX as usize) as u32)
-    {
-        Ok(p) => p,
-        Err(_) => return text_response(StatusCode::SERVICE_UNAVAILABLE, "Server busy"),
+    let reserve = (size as u64)
+        .min(state.cfg.max_inflight_bytes)
+        .min(u32::MAX as u64) as u32;
+    let Ok(permit) = state.budget.clone().acquire_many_owned(reserve).await else {
+        return text_response(StatusCode::SERVICE_UNAVAILABLE, "Shutting down");
     };
-    match encode_payload(&r.resource, &r.body) {
+    let encoded = if r.body.len() <= INLINE_ENCODE_MAX {
+        encode_payload(&r.resource, &r.body)
+    } else {
+        let r2 = r.clone();
+        tokio::task::spawn_blocking(move || encode_payload(&r2.resource, &r2.body))
+            .await
+            .unwrap_or_else(|e| Err(format!("encode task failed: {e}")))
+    };
+    match encoded {
         Ok(json) => json_response(
             StatusCode::OK,
             ChunkedBody::new(vec![Bytes::from(json)], Some(permit)),
@@ -656,6 +662,7 @@ fn handle_metrics(state: &AppState) -> Response<ChunkedBody> {
     metrics::gauge!(tm::MEM_BYTES).set(mem.weighted_size() as f64);
     metrics::gauge!(tm::MEM_ENTRIES).set(mem.entry_count() as f64);
     metrics::gauge!(tm::INFLIGHT_AVAILABLE).set(state.budget.available_permits() as f64);
+    tm::record_allocator();
     let mut r = Response::new(ChunkedBody::full(handle.render()));
     r.headers_mut().insert(
         header::CONTENT_TYPE,
