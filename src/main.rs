@@ -39,11 +39,16 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// Return freed pages to the OS at once. The server frees multi-MB buffers
 /// at a high rate under load; with a 1 s decay the loadgen held 2.4 GB of
 /// freed pages at c=32 (RSS peak 4.9 GB, against 2.5 GB with 0). The 1 s
-/// decay was about 10% faster there. Overridable with _RJEM_MALLOC_CONF.
+/// decay was about 10% faster there.
+///
+/// On Linux, rocksdb's jemalloc feature builds jemalloc without the `_rjem_`
+/// prefix so that it replaces malloc for RocksDB too. jemalloc then reads
+/// `malloc_conf`, not `_rjem_malloc_conf`, and the override variable is
+/// MALLOC_CONF. Elsewhere it keeps the prefix and _RJEM_MALLOC_CONF.
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
-#[export_name = "_rjem_malloc_conf"]
-pub static _rjem_malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0\0";
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 /// macOS jemalloc has no background threads; purging happens on the
 /// allocating threads instead.

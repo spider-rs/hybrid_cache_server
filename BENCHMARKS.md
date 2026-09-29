@@ -130,7 +130,8 @@ done
 
 N=3 benches/compression.sh $V030
 
-# jemalloc decay comparison
+# jemalloc decay comparison (on Linux since the rocksdb jemalloc feature,
+# the variable is MALLOC_CONF)
 _RJEM_MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000 \
   benches/run.sh $V030 scenario=seed,mixed sites=20 conc=32 secs=30 idle_after=5
 ```
