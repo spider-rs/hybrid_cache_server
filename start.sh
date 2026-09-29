@@ -47,12 +47,24 @@ wait_for_meili() {
   return 1
 }
 
-# -------- start/reuse meilisearch --------
-mkdir -p "$MEILI_DB_PATH" "$MEILI_DUMP_DIR"
+# -------- start/reuse meilisearch (only when MEILI_ENABLE=1) --------
+# The server does not read the Meilisearch index back, so since v0.3 it is
+# off by default. MEILI_ENABLE=1 turns indexing on in the server and makes
+# this script start meilisearch. Every other variable in the environment
+# (CACHE_PORT, ROCKSDB_PATH, MEM_CACHE_BYTES, ...) passes through the exec
+# below unchanged.
+meili_enabled() {
+  case "${MEILI_ENABLE:-0}" in 1|true|TRUE|yes|YES) ;; *) return 1 ;; esac
+  case "${MEILI_DISABLE:-0}" in 1|true|TRUE|yes|YES) return 1 ;; esac
+  return 0
+}
 
-if curl -fsS "$health_url" >/dev/null 2>&1; then
+if ! meili_enabled; then
+  echo "[boot] MEILI_ENABLE is not 1; not starting meilisearch"
+elif curl -fsS "$health_url" >/dev/null 2>&1; then
   echo "[boot] meilisearch already healthy at $MEILI_HTTP_ADDR; reusing"
 else
+  mkdir -p "$MEILI_DB_PATH" "$MEILI_DUMP_DIR"
   echo "[boot] meilisearch not healthy; restarting anything on port ${MEILI_HTTP_ADDR##*:}"
   kill_port_listeners
 
@@ -75,7 +87,7 @@ else
 fi
 
 # -------- start cache server --------
-echo "[boot] starting hybrid_cache_server on port $CACHE_PORT (MEILI_HOST=$MEILI_HOST, MEILI_INDEX=$MEILI_INDEX)"
+echo "[boot] starting hybrid_cache_server on port $CACHE_PORT (MEILI_ENABLE=${MEILI_ENABLE:-0}, ROCKSDB_PATH=${ROCKSDB_PATH:-cache_db})"
 
 # cargo install hybrid_cache_server
 
