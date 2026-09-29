@@ -34,10 +34,16 @@ Every setting is an environment variable. `start.sh` passes the environment thro
 | `CACHE_PORT` | `8080` | Listen port. |
 | `ROCKSDB_PATH` | `cache_db` | Database directory, relative to the working directory. |
 | `MEM_CACHE_BYTES` | 512 MiB | Byte budget of the in-memory cache. `0` turns it off. |
-| `MAX_BODY_BYTES` | 96 MiB | Largest request body. Bigger ones get 413. |
-| `MAX_INFLIGHT_BYTES` | 1 GiB | Request and response buffers held at once. Writes wait for room, site loads stop adding items, single lookups get 503. |
+| `MAX_BODY_BYTES` | 160 MiB | Largest request body. Bigger ones get 413. The fleet's largest batch, 16 bodies of 5 MiB, is about 107 MiB. |
+| `MAX_INFLIGHT_BYTES` | 1 GiB | Request and response buffers held at once. Writes and lookups wait for room; site loads stop adding items. |
+| `SMALL_REQUEST_BYTES` | 8 MiB | Reservations up to this size use a separate pool, so they never wait behind a large write. |
+| `MAX_INFLIGHT_SMALL_BYTES` | 128 MiB | Size of that pool. |
+| `MAX_BLOCKING_READS` | `64` | RocksDB reads, site scans and large encodes running at once. |
 | `MAX_SITE_RESPONSE_BYTES` | 64 MiB | Largest `/cache/site` response. Items past it are left out and the response carries `x-cache-truncated: size`. |
-| `REQUEST_TIMEOUT_SECS` | `30` | Per-request deadline. Past it the server answers 503. |
+| `REQUEST_TIMEOUT_SECS` | `30` | Deadline for GET and purge requests. Past it the server answers 503. |
+| `UPLOAD_TIMEOUT_SECS` | `120` | Deadline for `POST /cache/index` and `/cache/index/batch`, upload included. |
+| `WRITE_IDLE_TIMEOUT_SECS` | `30` | Closes a connection whose peer accepts no response bytes for this long, which frees the buffers it held. |
+| `TCP_TIMEOUT_SECS` | `30` | TCP keepalive idle time, and on Linux `TCP_USER_TIMEOUT`, on accepted sockets. |
 | `HEADER_READ_TIMEOUT_SECS` | `120` | Closes a connection that sends no complete request head for this long, idle keep-alive included. Keep it above the clients' pool idle timeout (90 s in spider_remote_cache). |
 | `MAX_CONNECTIONS` | `10000` | Concurrent connections. |
 | `COMPRESSION` | `zstd` | Response codec: `zstd`, `br`, `gzip` or `off`. gzip is always offered as a fallback. |
@@ -192,9 +198,11 @@ Lookup a cached resource by its `resource_key`.
   - `raw=1` → return raw bytes (instead of JSON/base64)
   - `format=bytes` or `format=raw` → same as `raw=1`
 
+The key may be percent-encoded as one path segment. The server tries it decoded first, then exactly as sent.
+
 #### Response
 
-- Default: JSON containing metadata + `body_base64`
+- Default: JSON containing metadata + `body_base64`, plus `created_at` (unix seconds) when the entry has one
 - With `raw=1` (or `format=raw|bytes`): returns the raw body bytes (content-type may be inferred from stored headers)
 
 #### Examples
@@ -216,7 +224,7 @@ Lookup cached resources by `website_key` (ex: a domain / site key).
 
 #### Response
 
-Returns a JSON array of the same payload objects `/cache/resource` returns. One response holds at most `MAX_SITE_RESPONSE_BYTES`; when items were left out, the `x-cache-truncated` header is `size` or `budget`.
+Returns a JSON array of the same payload objects `/cache/resource` returns. Site index keys are add-only: when a resource is written again under a different site key, both sites list it. One response holds at most `MAX_SITE_RESPONSE_BYTES`; when items were left out, the `x-cache-truncated` header is `size` or `budget`.
 
 #### Example
 
