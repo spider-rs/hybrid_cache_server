@@ -87,6 +87,11 @@ fn env_str(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+// Saturate before validation instead of truncating on 32-bit targets.
+fn env_capacity(name: &str, default: u64) -> usize {
+    usize::try_from(env_u64(name, default).max(1)).unwrap_or(usize::MAX)
+}
+
 impl Config {
     pub fn from_env() -> Self {
         // Meilisearch is off unless MEILI_ENABLE=1. MEILI_DISABLE=1 still wins,
@@ -96,8 +101,8 @@ impl Config {
                 host: env_str("MEILI_HOST", "http://127.0.0.1:7700"),
                 key: env_str("MEILI_MASTER_KEY", "masterKey"),
                 index: env_str("MEILI_INDEX", "hybrid_cache"),
-                queue_cap: env_u64("MEILI_QUEUE_CAP", 10_000).max(1) as usize,
-                batch_max: env_u64("MEILI_BATCH_MAX", 256).max(1) as usize,
+                queue_cap: env_capacity("MEILI_QUEUE_CAP", 10_000),
+                batch_max: env_capacity("MEILI_BATCH_MAX", 256),
                 flush_every: Duration::from_millis(env_u64("MEILI_FLUSH_MS", 200).max(10)),
             })
         } else {
@@ -118,7 +123,7 @@ impl Config {
                 .ok()
                 .and_then(|p| p.trim().parse().ok())
                 .unwrap_or(8080),
-            max_connections: env_u64("MAX_CONNECTIONS", 10_000).max(1) as usize,
+            max_connections: env_capacity("MAX_CONNECTIONS", 10_000),
             // The fleet's largest request is 16 bodies of 5 MiB as base64
             // JSON, about 107 MiB, which v0.2 accepted.
             max_body_bytes: env_u64("MAX_BODY_BYTES", 160 * MIB).max(1024),
@@ -130,7 +135,7 @@ impl Config {
             tcp_timeout: Duration::from_secs(env_u64("TCP_TIMEOUT_SECS", 30).max(1)),
             small_request_bytes: env_u64("SMALL_REQUEST_BYTES", 8 * MIB),
             max_inflight_small_bytes: env_u64("MAX_INFLIGHT_SMALL_BYTES", 128 * MIB).max(MIB),
-            max_blocking_reads: env_u64("MAX_BLOCKING_READS", 64).max(1) as usize,
+            max_blocking_reads: env_capacity("MAX_BLOCKING_READS", 64),
             header_read_timeout: Duration::from_secs(
                 env_u64("HEADER_READ_TIMEOUT_SECS", 120).max(1),
             ),
@@ -157,6 +162,34 @@ impl Config {
             ),
             full_sweep_every: env_u64("CACHE_FULL_SWEEP_EVERY", 144).max(1),
         }
+    }
+
+    /// Check before constructing any channels or semaphores. Keep the
+    /// existing lower clamps, but reject oversized configuration explicitly.
+    pub fn validate(&self) -> Result<(), String> {
+        fn capacity(name: &str, value: usize, practical_max: usize) -> Result<(), String> {
+            let max = practical_max.min(tokio::sync::Semaphore::MAX_PERMITS);
+            if value == 0 || value > max {
+                return Err(format!("{name} must be in 1..={max}, got {value}"));
+            }
+            Ok(())
+        }
+        capacity("MAX_CONNECTIONS", self.max_connections, 1_000_000)?;
+        capacity("MAX_BLOCKING_READS", self.max_blocking_reads, 4096)?;
+        if let Some(meili) = &self.meili {
+            capacity("MEILI_QUEUE_CAP", meili.queue_cap, 1_000_000)?;
+            capacity("MEILI_BATCH_MAX", meili.batch_max, 1_000_000)?;
+        }
+        let max_bytes = tokio::sync::Semaphore::MAX_PERMITS as u64;
+        for (name, value) in [
+            ("MAX_INFLIGHT_BYTES", self.max_inflight_bytes),
+            ("MAX_INFLIGHT_SMALL_BYTES", self.max_inflight_small_bytes),
+        ] {
+            if value == 0 || value > max_bytes {
+                return Err(format!("{name} must be in 1..={max_bytes}, got {value}"));
+            }
+        }
+        Ok(())
     }
 
     /// Defaults with no environment, for tests.

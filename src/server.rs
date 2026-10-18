@@ -22,7 +22,7 @@ use crate::{
     config::{Compression, Config},
     meili::{CacheIndexDoc, Meili},
     model::{encode_payload, IncomingPayload},
-    store::{prepare_entry, resolve_website_key, SiteKeyPrecedence, Store},
+    store::{prepare_entry, resolve_website_key, CommitError, SiteKeyPrecedence, Store},
     telemetry as tm,
 };
 
@@ -409,6 +409,7 @@ where
 enum PutOutcome {
     BadJson(String),
     NothingIndexed,
+    Busy,
     CommitFailed(String),
     Indexed { ok: usize, failed: usize },
 }
@@ -482,7 +483,8 @@ where
         };
         match st.store.commit(prepared) {
             Ok(ok) => (PutOutcome::Indexed { ok, failed }, docs),
-            Err(e) => (PutOutcome::CommitFailed(e), Vec::new()),
+            Err(CommitError::Busy) => (PutOutcome::Busy, Vec::new()),
+            Err(CommitError::Storage(e)) => (PutOutcome::CommitFailed(e), Vec::new()),
         }
     })
     .await;
@@ -512,6 +514,7 @@ where
                 text_response(StatusCode::INTERNAL_SERVER_ERROR, "Index error")
             }
         }
+        PutOutcome::Busy => storage_busy("Storage busy"),
         PutOutcome::CommitFailed(e) => {
             error!("commit failed: {e}");
             text_response(StatusCode::INTERNAL_SERVER_ERROR, "Index error")
@@ -709,7 +712,15 @@ async fn site_lookup(state: Arc<AppState>, website_key: String) -> Response<Chun
 
 async fn handle_size(state: Arc<AppState>) -> Response<ChunkedBody> {
     let st = state.clone();
-    match tokio::task::spawn_blocking(move || st.store.size_report()).await {
+    let Ok(slot) = state.blocking_reads.clone().try_acquire_owned() else {
+        return storage_busy("Storage busy");
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        st.store.size_report()
+    })
+    .await
+    {
         Ok(Ok(report)) => {
             let json = serde_json::to_vec(&report).unwrap_or_else(|_| b"{}".to_vec());
             json_response(StatusCode::OK, ChunkedBody::full(json))
@@ -725,11 +736,23 @@ async fn handle_size(state: Arc<AppState>) -> Response<ChunkedBody> {
     }
 }
 
+fn storage_busy(message: &'static str) -> Response<ChunkedBody> {
+    let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, message);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+    response
+}
+
 fn handle_purge_empty(state: Arc<AppState>) -> Response<ChunkedBody> {
-    // Runs detached so it survives the client hanging up.
+    let purge = match state.store.reserve_purge() {
+        Ok(job) => job,
+        Err(_) => return storage_busy("Maintenance busy"),
+    };
+    // Runs detached so it survives the client hanging up. Admission belongs
+    // to the job, including time queued on the blocking pool.
     tokio::spawn(async move {
-        let st = state.clone();
-        match tokio::task::spawn_blocking(move || st.store.purge_empty()).await {
+        match tokio::task::spawn_blocking(purge).await {
             Ok(Ok(r)) => {
                 tracing::info!(
                     "purge_empty done: removed {} resources, {} bodies",
