@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let cfg = Config::from_env();
+    cfg.validate()?;
     let prometheus = tm::install();
     info!("{}", tm::allocator_decay());
 
@@ -104,7 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
         netio::tune_socket(&stream, cfg.tcp_timeout);
-        let Ok(permit) = conns.clone().acquire_owned().await else {
+        // Shed excess sockets immediately; an idle keep-alive connection
+        // must not make the accept loop wait for a permit indefinitely.
+        let Ok(permit) = conns.clone().try_acquire_owned() else {
             continue;
         };
         let state = state.clone();
@@ -181,7 +184,6 @@ async fn run_cleanup_worker(state: Arc<AppState>) {
         // The first pass and every Nth after it also sweep all stored bodies,
         // which clears bodies orphaned before v0.3 tracked overwrites.
         let full = pass.is_multiple_of(state.cfg.full_sweep_every);
-        pass += 1;
         let ttl = state.cfg.cache_ttl_secs;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -190,6 +192,9 @@ async fn run_cleanup_worker(state: Arc<AppState>) {
         let st = state.clone();
         match tokio::task::spawn_blocking(move || st.store.cleanup(ttl, now, full)).await {
             Ok(Ok(r)) => {
+                // Failed/busy passes still owe their sweep. In particular,
+                // do not postpone legacy orphans for another full cycle.
+                pass = pass.wrapping_add(1);
                 if !r.expired_resource_keys.is_empty() || r.removed_files > 0 {
                     info!(
                         "cleanup: scanned {} resources, removed {} expired, {} bodies{}",

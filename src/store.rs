@@ -12,9 +12,16 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fmt, fs,
+    future::Future,
+    io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{sync_channel, SyncSender},
+        Arc,
+    },
+    task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
 
@@ -23,7 +30,10 @@ use bytes::Bytes;
 use moka::sync::Cache;
 use rocksdb::{BlockBasedOptions, DBCompressionType, Options, ReadOptions, WriteBatch, DB};
 use serde::Serialize;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+
+#[cfg(test)]
+use std::sync::{atomic::AtomicBool, Mutex};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -37,43 +47,153 @@ use crate::{
 pub type MemCache = Cache<String, Arc<CachedResource>>;
 
 #[cfg(test)]
-type TestHook = Box<dyn FnOnce(&Store) + Send>;
+pub(crate) type TestHook = Box<dyn FnOnce(&Store) + Send>;
 
 pub struct Store {
     pub db: Arc<DB>,
     pub mem: MemCache,
     pub path: PathBuf,
     gc: Gc,
-    /// Test hook run by `cleanup` between its scan and its delete phase.
+    /// Test hook run by either collector between its scan and delete phase.
     #[cfg(test)]
     pub after_scan: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    pub hooks: TestHooks,
 }
 
-/// Coordinates writers with the file-body garbage collector.
-///
-/// A body may be shared by many resources, and since v0.3 a writer skips
-/// the `file:` put when the body already exists. So the collector must never
-/// delete a body that a concurrent writer has just decided to reuse. Rules:
-///
-/// - A writer holds `lock` for reading from before its existence check until
-///   its batch is committed, and records every file_id it references in
-///   `touched` first.
-/// - The collector clears `touched` and takes its snapshot under the write
-///   lock. Every write is then either committed before the snapshot (so the
-///   scan sees its reference) or recorded in `touched`.
-/// - The collector deletes under the write lock, skipping anything that is
-///   referenced in the snapshot or present in `touched`.
+/// Writers and competing maintenance requests never queue. A collector
+/// queues for all writer slots, closing admission until existing writes drain.
+/// Writers hold one slot through the existence check, batch and mem update;
+/// snapshot creation and deletion require every slot. The maintenance slot
+/// spans the entire scan so cleanup and purge cannot reset each other's epoch.
+/// Slots coordinate exclusion, not upload capacity: the request byte budgets
+/// and blocking pool already bound uploads. Do not add a small commit limit.
+const WRITE_SLOTS: u32 = if Semaphore::MAX_PERMITS < u32::MAX as usize {
+    Semaphore::MAX_PERMITS as u32
+} else {
+    u32::MAX
+};
+const GC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Wake a blocking collector when its queued semaphore acquisition is ready.
+/// A single coalesced notification suffices; waking never waits for the reader.
+struct AdmissionWake(SyncSender<()>);
+
+impl Wake for AdmissionWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+/// A bounded, conservative set of bodies referenced or orphaned during an
+/// epoch. Hash collisions only retain extra bodies until a later pass. Unlike
+/// an evicting set, saturation cannot forget a writer's protection. At 128 KiB
+/// per Store this does not grow with write volume or a slow scan.
+const TOUCH_WORDS: usize = 16_384;
+
+// Every reference is either committed before the snapshot (and scanned),
+// or marked before its file existence check. Taking every writer slot for
+// deletion excludes in-flight reuse decisions; maintenance admission excludes
+// a second collector resetting these marks. No map guards or busy waits.
 struct Gc {
-    lock: RwLock<()>,
-    touched: Mutex<HashSet<String>>,
-    /// Serializes TTL cleanup and purge, which both reset `touched`.
-    maintenance: Mutex<()>,
+    writers: Semaphore,
+    maintenance: Arc<Semaphore>,
+    touched: Box<[AtomicU64]>,
+}
+
+impl Gc {
+    fn new() -> Self {
+        Self {
+            writers: Semaphore::new(WRITE_SLOTS as usize),
+            maintenance: Arc::new(Semaphore::new(1)),
+            touched: (0..TOUCH_WORDS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn maintenance(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.maintenance
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "storage busy: maintenance active".to_string())
+    }
+
+    fn touch_bit(file_id: &[u8]) -> (usize, u64) {
+        let hash = blake3::hash(file_id);
+        let h = hash.as_bytes();
+        let bit = u32::from_le_bytes([h[0], h[1], h[2], h[3]]) as usize;
+        ((bit / 64) % TOUCH_WORDS, 1u64 << (bit % 64))
+    }
+
+    fn touch(&self, file_id: &[u8]) {
+        let (word, bit) = Self::touch_bit(file_id);
+        self.touched[word].fetch_or(bit, Ordering::Relaxed);
+    }
+
+    fn touched(&self, file_id: &[u8]) -> bool {
+        let (word, bit) = Self::touch_bit(file_id);
+        self.touched[word].load(Ordering::Relaxed) & bit != 0
+    }
+
+    // Only called with every writer slot and the maintenance slot held.
+    // Semaphore release/acquire orders the relaxed bitmap operations.
+    fn reset(&self) {
+        for word in &self.touched {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Deterministic barriers and I/O faults; absent from production builds.
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestHooks {
+    pub before_commit: Mutex<Option<TestHook>>,
+    pub before_delete: Mutex<Option<TestHook>>,
+    pub before_gc_wait: Mutex<Option<TestHook>>,
+    pub fail_write: AtomicBool,
+    pub fail_gc_read: AtomicBool,
+}
+
+#[cfg(test)]
+fn run_hook(hook: &Mutex<Option<TestHook>>, store: &Store) {
+    // Drop the test mutex before calling code that can reenter the store.
+    let hook = hook.lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook(store);
+    }
 }
 
 /// One resource ready to be committed.
 pub struct PreparedEntry {
     pub resource: ResourceEntry,
     pub body: Bytes,
+}
+
+#[derive(Debug)]
+pub enum CommitError {
+    Busy,
+    Storage(String),
+}
+
+impl From<String> for CommitError {
+    fn from(error: String) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl fmt::Display for CommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Busy => {
+                f.write_str("storage busy: collector pending or write capacity exhausted")
+            }
+            Self::Storage(error) => f.write_str(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,13 +401,11 @@ impl Store {
             db,
             mem,
             path: PathBuf::from(&cfg.rocksdb_path),
-            gc: Gc {
-                lock: RwLock::new(()),
-                touched: Mutex::new(HashSet::new()),
-                maintenance: Mutex::new(()),
-            },
+            gc: Gc::new(),
             #[cfg(test)]
             after_scan: Mutex::new(None),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         }
     }
 
@@ -517,19 +635,20 @@ impl Store {
     }
 
     /// Commit entries in one WriteBatch, then admit them to the mem cache.
-    pub fn commit(&self, entries: Vec<PreparedEntry>) -> Result<usize, String> {
+    pub fn commit(&self, entries: Vec<PreparedEntry>) -> Result<usize, CommitError> {
         if entries.is_empty() {
             return Ok(0);
         }
+        let _writer = self
+            .gc
+            .writers
+            .try_acquire()
+            .map_err(|_| CommitError::Busy)?;
         let count = entries.len();
         let mut batch = WriteBatch::default();
         {
-            let _gc = self.gc.lock.read().unwrap_or_else(|e| e.into_inner());
-            {
-                let mut touched = self.gc.touched.lock().unwrap_or_else(|e| e.into_inner());
-                for e in &entries {
-                    touched.insert(e.resource.file_id.clone());
-                }
+            for e in &entries {
+                self.gc.touch(e.resource.file_id.as_bytes());
             }
 
             let mut files_in_batch: HashSet<&str> = HashSet::new();
@@ -557,12 +676,14 @@ impl Store {
                             .ok()
                             .map(|m| m.file_id.into_owned()),
                         Ok(None) => None,
-                        Err(e) => return Err(format!("rocksdb get resource: {e}")),
+                        Err(e) => return Err(format!("rocksdb get resource: {e}").into()),
                     },
                 };
                 if let Some(old_file) = prev {
                     if old_file != r.file_id {
-                        // The old body may now be unreferenced; let GC decide.
+                        // Protect the new orphan marker from a collector
+                        // whose snapshot still saw this body as live.
+                        self.gc.touch(old_file.as_bytes());
                         batch.put(format!("orph:{old_file}").as_bytes(), b"");
                     }
                 }
@@ -585,8 +706,9 @@ impl Store {
                 );
             }
 
-            timed(tm::DB_WRITE, || self.db.write(batch))
-                .map_err(|e| format!("rocksdb batch write: {e}"))?;
+            #[cfg(test)]
+            run_hook(&self.hooks.before_commit, self);
+            timed(tm::DB_WRITE, || self.write_batch(batch, "batch"))?;
         }
 
         for e in entries {
@@ -604,14 +726,72 @@ impl Store {
 
     // ------------------------------------------------------------ maintenance
 
-    fn begin_gc_epoch(&self) -> rocksdb::SnapshotWithThreadMode<'_, DB> {
-        let _w = self.gc.lock.write().unwrap_or_else(|e| e.into_inner());
-        self.gc
-            .touched
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.db.snapshot()
+    /// Drive one fair semaphore acquisition on this blocking storage thread.
+    /// Once polled, Tokio reserves slots for this collector as writers finish;
+    /// new try_acquire writers cannot pass it. Sleep on wake notifications,
+    /// never spin or repeatedly race writers for an unqueued acquisition.
+    /// The deadline bounds a stuck writer. Dropping the future on timeout
+    /// returns any partial reservation and reopens writer admission.
+    fn gc_exclusive(&self) -> Result<SemaphorePermit<'_>, String> {
+        let deadline = Instant::now() + GC_ADMISSION_TIMEOUT;
+        let (wake, ready) = sync_channel(1);
+        let waker = Waker::from(Arc::new(AdmissionWake(wake)));
+        let mut cx = Context::from_waker(&waker);
+        // This future is driven by a blocking thread, not an async executor.
+        // Disable cooperative task-budget yields so every Pending means an
+        // actual semaphore wait, including tests called from an async task.
+        let mut acquire = std::pin::pin!(tokio::task::unconstrained(
+            self.gc.writers.acquire_many(WRITE_SLOTS)
+        ));
+        let timeout_error =
+            || "storage busy: writers active after GC admission deadline".to_string();
+        loop {
+            if Instant::now() >= deadline {
+                return Err(timeout_error());
+            }
+            match acquire.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => {
+                    return result.map_err(|_| "storage busy: writer admission closed".to_string());
+                }
+                Poll::Pending => {}
+            }
+            #[cfg(test)]
+            run_hook(&self.hooks.before_gc_wait, self);
+            ready
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| timeout_error())?;
+        }
+    }
+
+    fn write_batch(&self, batch: WriteBatch, operation: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if self.hooks.fail_write.swap(false, Ordering::Relaxed) {
+            return Err(format!("rocksdb {operation} write: injected I/O failure"));
+        }
+        self.db
+            .write(batch)
+            .map_err(|e| format!("rocksdb {operation} write: {e}"))
+    }
+
+    /// A storage read failure must abort the entire delete batch: its body
+    /// may still be referenced by a resource we could not recheck. Malformed
+    /// metadata is skipped by the collectors, as it is during their scans.
+    fn gc_resource(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, String> {
+        #[cfg(test)]
+        if self.hooks.fail_gc_read.swap(false, Ordering::Relaxed) {
+            return Err("rocksdb GC read: injected I/O failure".into());
+        }
+        self.db
+            .get_pinned(key)
+            .map_err(|e| format!("rocksdb GC read: {e}"))
+    }
+
+    // The caller holds maintenance admission until deletion and cache
+    // invalidation finish, including all early-error and cancellation paths.
+    fn begin_gc_epoch(&self) -> Result<rocksdb::SnapshotWithThreadMode<'_, DB>, String> {
+        let _exclusive = self.gc_exclusive()?;
+        self.gc.reset();
+        Ok(self.db.snapshot())
     }
 
     /// TTL cleanup. Deletes expired resources, then every body that no live
@@ -625,15 +805,11 @@ impl Store {
         now: i64,
         full_sweep: bool,
     ) -> Result<CleanupResult, String> {
-        let _m = self
-            .gc
-            .maintenance
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _maintenance = self.gc.maintenance()?;
         let started = Instant::now();
         let mut result = CleanupResult::default();
 
-        let snap = self.begin_gc_epoch();
+        let snap = self.begin_gc_epoch()?;
         let mut live: HashSet<Vec<u8>> = HashSet::new();
         let mut expired: Vec<String> = Vec::new();
         let mut candidates: HashSet<Vec<u8>> = HashSet::new();
@@ -700,36 +876,45 @@ impl Store {
         drop(snap);
         candidates.retain(|f| !live.contains(f));
         #[cfg(test)]
-        if let Some(hook) = self.after_scan.lock().unwrap().take() {
-            hook(self);
-        }
+        run_hook(&self.after_scan, self);
 
         let mut batch = WriteBatch::default();
         {
-            let _w = self.gc.lock.write().unwrap_or_else(|e| e.into_inner());
+            let _exclusive = self.gc_exclusive()?;
+            #[cfg(test)]
+            run_hook(&self.hooks.before_delete, self);
             // Re-check each expired resource: a writer may have refreshed it
             // since the scan.
             for rk in &expired {
                 let key = format!("res:{rk}");
-                let Ok(Some(raw)) = self.db.get_pinned(key.as_bytes()) else {
+                let Some(raw) = self.gc_resource(key.as_bytes())? else {
                     continue;
                 };
-                let Ok(m) = serde_json::from_slice::<ResourceMeta>(&raw) else {
-                    continue;
+                let m = match serde_json::from_slice::<ResourceMeta>(&raw) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("cleanup: unreadable resource entry during recheck: {e}");
+                        continue;
+                    }
                 };
                 if now - m.created_at.unwrap_or(now) > ttl_secs {
                     batch.delete(key.as_bytes());
                     batch.delete(format!("site:{}::{}", m.website_key, rk).as_bytes());
+                    // If this body is protected this pass, keep durable
+                    // work for the next incremental cleanup.
+                    batch.put(format!("orph:{}", m.file_id).as_bytes(), b"");
                     result.expired_resource_keys.push(rk.clone());
                 }
             }
-            let touched = self.gc.touched.lock().unwrap_or_else(|e| e.into_inner());
             for f in &candidates {
                 let Ok(fid) = std::str::from_utf8(f) else {
                     continue;
                 };
-                if touched.contains(fid) {
-                    continue; // keep its marker; judged again next pass
+                if self.gc.touched(f) {
+                    // Full sweeps also find legacy orphans without markers.
+                    // Retained candidates must remain incremental GC work.
+                    batch.put(format!("orph:{fid}").as_bytes(), b"");
+                    continue;
                 }
                 let fkey = format!("file:{fid}");
                 if self.db.key_may_exist(fkey.as_bytes()) {
@@ -740,18 +925,14 @@ impl Store {
             }
             // Markers whose body turned out to be live are settled.
             for m in &markers {
-                if live.contains(m) {
+                if live.contains(m) && !self.gc.touched(m) {
                     batch.delete([b"orph:".as_slice(), m].concat());
                 }
             }
-            drop(touched);
-            self.db
-                .write(batch)
-                .map_err(|e| format!("rocksdb cleanup write: {e}"))?;
-        }
-
-        for rk in &result.expired_resource_keys {
-            self.mem.invalidate(rk);
+            self.write_batch(batch, "cleanup")?;
+            for rk in &result.expired_resource_keys {
+                self.mem.invalidate(rk);
+            }
         }
         metrics::histogram!(tm::CLEANUP_DURATION).record(started.elapsed().as_secs_f64());
         metrics::counter!(tm::CLEANUP_REMOVED_RESOURCES)
@@ -760,16 +941,29 @@ impl Store {
         Ok(result)
     }
 
-    /// Remove resources whose body is an empty HTML page.
-    pub fn purge_empty(&self) -> Result<PurgeResult, String> {
-        let _m = self
-            .gc
-            .maintenance
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    /// Reserve before spawning so a flood of purge requests cannot queue
+    /// scans. Dropping an unstarted job releases admission; a started job
+    /// owns it through completion even when its requester disconnects.
+    pub fn reserve_purge(
+        self: &Arc<Self>,
+    ) -> Result<impl FnOnce() -> Result<PurgeResult, String> + Send + 'static, String> {
+        let permit = self.gc.maintenance()?;
+        let store = self.clone();
+        Ok(move || store.purge_empty_admitted(permit))
+    }
 
+    #[cfg(test)]
+    pub fn purge_empty(&self) -> Result<PurgeResult, String> {
+        self.purge_empty_admitted(self.gc.maintenance()?)
+    }
+
+    /// Remove resources whose body is an empty HTML page.
+    fn purge_empty_admitted(
+        &self,
+        _maintenance: OwnedSemaphorePermit,
+    ) -> Result<PurgeResult, String> {
         let mut empty: HashSet<String> = known_empty_page_file_ids();
-        let snap = self.begin_gc_epoch();
+        let snap = self.begin_gc_epoch()?;
 
         // Phase 1: scan small bodies for empty pages. Values are read in
         // place; nothing over 2 KiB is copied or parsed.
@@ -819,12 +1013,15 @@ impl Store {
                 if !k.starts_with(b"res:") {
                     break;
                 }
-                if let Ok(m) = serde_json::from_slice::<ResourceMeta>(v) {
-                    if empty.contains(m.file_id.as_ref()) {
-                        purge.push(m.resource_key.into_owned());
-                    } else {
-                        live.insert(m.file_id.into_owned());
+                match serde_json::from_slice::<ResourceMeta>(v) {
+                    Ok(m) => {
+                        if empty.contains(m.file_id.as_ref()) {
+                            purge.push(m.resource_key.into_owned());
+                        } else {
+                            live.insert(m.file_id.into_owned());
+                        }
                     }
+                    Err(e) => warn!("purge: unreadable resource entry: {e}"),
                 }
                 it.next();
             }
@@ -832,45 +1029,63 @@ impl Store {
         }
         drop(snap);
 
-        // Phase 3: delete under the GC lock, re-checking against writes.
+        #[cfg(test)]
+        run_hook(&self.after_scan, self);
+
+        // Phase 3: drain existing writers with a deadline, then recheck writes.
         let mut result = PurgeResult::default();
         let mut batch = WriteBatch::default();
         {
-            let _w = self.gc.lock.write().unwrap_or_else(|e| e.into_inner());
+            let _exclusive = self.gc_exclusive()?;
+            #[cfg(test)]
+            run_hook(&self.hooks.before_delete, self);
             for rk in &purge {
                 let key = format!("res:{rk}");
-                let Ok(Some(raw)) = self.db.get_pinned(key.as_bytes()) else {
+                let Some(raw) = self.gc_resource(key.as_bytes())? else {
                     continue;
                 };
-                let Ok(m) = serde_json::from_slice::<ResourceMeta>(&raw) else {
-                    continue;
+                let m = match serde_json::from_slice::<ResourceMeta>(&raw) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("purge: unreadable resource entry during recheck: {e}");
+                        continue;
+                    }
                 };
                 if empty.contains(m.file_id.as_ref()) {
                     batch.delete(key.as_bytes());
                     batch.delete(format!("site:{}::{}", m.website_key, rk).as_bytes());
+                    // If this body is protected this pass, keep durable
+                    // work for the next incremental cleanup.
+                    batch.put(format!("orph:{}", m.file_id).as_bytes(), b"");
                     result.resource_keys.push(rk.clone());
                 }
             }
-            let touched = self.gc.touched.lock().unwrap_or_else(|e| e.into_inner());
             for fid in &empty {
-                if live.contains(fid) || touched.contains(fid) {
+                if live.contains(fid) {
+                    continue;
+                }
+                if self.gc.touched(fid.as_bytes()) {
+                    batch.put(format!("orph:{fid}").as_bytes(), b"");
                     continue;
                 }
                 let fkey = format!("file:{fid}");
-                if matches!(self.db.get_pinned(fkey.as_bytes()), Ok(Some(_))) {
+                if self
+                    .db
+                    .get_pinned(fkey.as_bytes())
+                    .map_err(|e| format!("rocksdb purge read: {e}"))?
+                    .is_some()
+                {
                     batch.delete(fkey.as_bytes());
                     result.purged_files += 1;
                 }
+                batch.delete(format!("orph:{fid}").as_bytes());
             }
-            drop(touched);
-            self.db
-                .write(batch)
-                .map_err(|e| format!("rocksdb purge write: {e}"))?;
+            self.write_batch(batch, "purge")?;
+            for rk in &result.resource_keys {
+                self.mem.invalidate(rk);
+            }
         }
         result.purged_resources = result.resource_keys.len();
-        for rk in &result.resource_keys {
-            self.mem.invalidate(rk);
-        }
         Ok(result)
     }
 
@@ -1025,4 +1240,105 @@ fn is_empty_html_str(text: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    #[test]
+    fn gc_write_admission_has_no_64_commit_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::for_tests(dir.path().join("db").to_str().unwrap());
+        let store = Store::open(&cfg).unwrap();
+        // Hold the same slots as 64 in-flight commits, then perform real I/O
+        // with a 65th. Upload byte budgets remain the capacity bound.
+        let _writers = store.gc.writers.try_acquire_many(64).unwrap();
+        assert_eq!(
+            store
+                .commit(vec![crate::tests::gc_entry("extra", b"body", 100)])
+                .unwrap(),
+            1
+        );
+        store.mem.invalidate_all();
+        assert_eq!(
+            &store.get_resource("extra", false).unwrap().unwrap().body[..],
+            b"body"
+        );
+    }
+
+    #[test]
+    fn gc_admission_timeout_returns_partial_reservations_and_reopens_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::for_tests(dir.path().join("db").to_str().unwrap());
+        let store = Store::open(&cfg).unwrap();
+        let writer = store.gc.writers.try_acquire().unwrap();
+        let started = Instant::now();
+        assert!(store
+            .gc_exclusive()
+            .unwrap_err()
+            .contains("admission deadline"));
+        assert!(started.elapsed() >= GC_ADMISSION_TIMEOUT);
+        assert!(started.elapsed() < GC_ADMISSION_TIMEOUT + Duration::from_secs(2));
+        assert_eq!(
+            store.gc.writers.available_permits(),
+            WRITE_SLOTS as usize - 1
+        );
+        // A failed collector must not keep its gate closed even though the
+        // original writer is still running.
+        assert_eq!(
+            store
+                .commit(vec![crate::tests::gc_entry("retry", b"body", 100)])
+                .unwrap(),
+            1
+        );
+        drop(writer);
+        assert!(store.gc_exclusive().is_ok());
+    }
+
+    #[test]
+    fn gc_saturated_filter_defers_bodies_without_losing_incremental_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::for_tests(dir.path().join("db").to_str().unwrap());
+        let store = Store::open(&cfg).unwrap();
+        let live = b"referenced body";
+        let live_id = compute_file_id(live);
+        store
+            .commit(vec![PreparedEntry {
+                resource: ResourceEntry {
+                    website_key: "gc".into(),
+                    resource_key: "live".into(),
+                    url: "https://gc/".into(),
+                    method: "GET".into(),
+                    status: 200,
+                    request_headers: HashMap::new(),
+                    response_headers: HashMap::new(),
+                    file_id: live_id.clone(),
+                    http_version: Default::default(),
+                    created_at: Some(100),
+                },
+                body: Bytes::from_static(live),
+            }])
+            .unwrap();
+        // A legacy orphan with no marker: even a false positive must not
+        // require another full sweep to make progress after saturation ends.
+        store.db.put(b"file:legacy", b"unreferenced").unwrap();
+        *store.after_scan.lock().unwrap() = Some(Box::new(|store| {
+            for word in &store.gc.touched {
+                word.store(u64::MAX, Ordering::Relaxed);
+            }
+        }));
+        assert_eq!(store.cleanup(10, 100, true).unwrap().removed_files, 0);
+        assert!(store.db.get(b"file:legacy").unwrap().is_some());
+        assert!(store.db.get(b"orph:legacy").unwrap().is_some());
+        assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 1);
+        assert!(store.db.get(b"file:legacy").unwrap().is_none());
+        assert!(store.db.get(b"orph:legacy").unwrap().is_none());
+        store.mem.invalidate_all();
+        assert_eq!(
+            &store.get_resource("live", false).unwrap().unwrap().body[..],
+            live
+        );
+        assert!(store.db.get(format!("file:{live_id}")).unwrap().is_some());
+    }
 }

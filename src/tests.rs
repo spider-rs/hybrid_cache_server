@@ -995,6 +995,890 @@ async fn full_sweep_collects_pre_v03_orphans() {
     assert!(file_exists(store, &compute_file_id(b"live")));
 }
 
+// ---------------------------------------------------------------- GC admission races
+
+pub(crate) fn gc_entry(key: &str, body: &[u8], created_at: i64) -> crate::store::PreparedEntry {
+    let json = serde_json::to_vec(&payload(Some("gc"), key, "https://gc/", body)).unwrap();
+    let p: IncomingPayload = serde_json::from_slice(&json).unwrap();
+    let mut e = prepare_entry(p, "gc".into()).unwrap();
+    e.resource.created_at = Some(created_at);
+    e
+}
+
+fn gc_orphan(store: &Store, body: &[u8]) -> String {
+    let fid = compute_file_id(body);
+    store.db.put(format!("file:{fid}"), body).unwrap();
+    store.db.put(format!("orph:{fid}"), b"").unwrap();
+    fid
+}
+
+fn gc_collect(store: &Store, purge: bool) -> Result<(usize, usize), String> {
+    if purge {
+        store
+            .purge_empty()
+            .map(|r| (r.purged_resources, r.purged_files))
+    } else {
+        store
+            .cleanup(10, 100, true)
+            .map(|r| (r.expired_resource_keys.len(), r.removed_files))
+    }
+}
+
+const GC_EMPTY: &[u8] = b"<html><head></head><body></body></html>";
+const GC_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Every barrier has a deadline, and an assertion failure releases its peer.
+/// Production code never waits on these test-only hooks.
+struct GcPause {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::SyncSender<()>,
+}
+
+impl GcPause {
+    fn at(hook: &std::sync::Mutex<Option<crate::store::TestHook>>) -> Self {
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        *hook.lock().unwrap() = Some(Box::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(GC_WAIT)
+                .expect("test did not release GC barrier");
+        }));
+        Self { entered, release }
+    }
+
+    fn wait(&self) {
+        self.entered
+            .recv_timeout(GC_WAIT)
+            .expect("worker did not reach GC barrier");
+    }
+}
+
+impl Drop for GcPause {
+    fn drop(&mut self) {
+        let _ = self.release.try_send(());
+    }
+}
+
+fn gc_assert_body(store: &Store, key: &str, expected: &[u8]) {
+    // Bypass memory: a cached body must not hide a dangling on-disk reference.
+    store.mem.invalidate_all();
+    assert_eq!(
+        &store.get_resource(key, false).unwrap().unwrap().body[..],
+        expected
+    );
+}
+
+#[test]
+fn gc_scan_preserves_reuse_when_competing_maintenance_is_rejected() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        let fid = gc_orphan(store, GC_EMPTY);
+        let control = gc_orphan(store, b"<html lang=\"control\"><body></body></html>");
+        let pause = GcPause::at(&store.after_scan);
+        std::thread::scope(|scope| {
+            let gc = scope.spawn(|| gc_collect(store, purge));
+            pause.wait();
+            store
+                .commit(vec![gc_entry("reused", GC_EMPTY, 100)])
+                .unwrap();
+            // Both the other collector and a duplicate request must fail
+            // without resetting the first collector's protection bitmap.
+            assert!(store
+                .cleanup(10, 100, true)
+                .unwrap_err()
+                .contains("maintenance active"));
+            assert!(store
+                .purge_empty()
+                .unwrap_err()
+                .contains("maintenance active"));
+            drop(pause);
+            assert_eq!(gc.join().unwrap().unwrap(), (0, 1));
+        });
+        assert!(file_exists(store, &fid));
+        assert!(!file_exists(store, &control));
+        gc_assert_body(store, "reused", GC_EMPTY);
+        assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 0);
+        assert!(store.db.get(format!("orph:{fid}")).unwrap().is_none());
+    }
+}
+
+#[test]
+fn gc_snapshot_cannot_pass_an_inflight_body_existence_check() {
+    let t = env();
+    let store = &t.state.store;
+    let fid = gc_orphan(store, GC_EMPTY);
+    let pause = GcPause::at(&store.hooks.before_commit);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| store.commit(vec![gc_entry("reused", GC_EMPTY, 100)]));
+        pause.wait(); // The writer has decided to skip the existing file put.
+        for purge in [false, true] {
+            assert!(gc_collect(store, purge)
+                .unwrap_err()
+                .contains("writers active"));
+        }
+        assert!(file_exists(store, &fid));
+        drop(pause);
+        assert_eq!(writer.join().unwrap().unwrap(), 1);
+    });
+    assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 0);
+    gc_assert_body(store, "reused", GC_EMPTY);
+}
+
+#[test]
+fn gc_delete_cannot_pass_a_writer_that_started_after_the_snapshot() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        let fid = gc_orphan(store, GC_EMPTY);
+        let scan = GcPause::at(&store.after_scan);
+        let write = GcPause::at(&store.hooks.before_commit);
+        std::thread::scope(|scope| {
+            let gc = scope.spawn(|| gc_collect(store, purge));
+            scan.wait();
+            let writer = scope.spawn(|| store.commit(vec![gc_entry("reused", GC_EMPTY, 100)]));
+            write.wait();
+            drop(scan);
+            assert!(gc.join().unwrap().unwrap_err().contains("writers active"));
+            assert!(file_exists(store, &fid));
+            drop(write);
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 0);
+        gc_assert_body(store, "reused", GC_EMPTY);
+    }
+}
+
+#[test]
+fn gc_delete_sheds_writers_and_retry_recreates_the_collected_body() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        let fid = gc_orphan(store, GC_EMPTY);
+        let pause = GcPause::at(&store.hooks.before_delete);
+        std::thread::scope(|scope| {
+            let gc = scope.spawn(|| gc_collect(store, purge));
+            pause.wait();
+            assert!(store
+                .commit(vec![gc_entry("retry", GC_EMPTY, 100)])
+                .unwrap_err()
+                .to_string()
+                .contains("storage busy"));
+            assert!(store.db.get(b"res:retry").unwrap().is_none());
+            assert!(store.get_cached("retry").is_none());
+            drop(pause);
+            assert_eq!(gc.join().unwrap().unwrap(), (0, 1));
+        });
+        assert!(!file_exists(store, &fid));
+        store
+            .commit(vec![gc_entry("retry", GC_EMPTY, 100)])
+            .unwrap();
+        gc_assert_body(store, "retry", GC_EMPTY);
+    }
+}
+
+#[test]
+fn gc_collectors_finish_under_continuous_writes_at_both_admission_phases() {
+    use crate::store::CommitError;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    for purge in [false, true] {
+        for after_snapshot in [false, true] {
+            let t = env();
+            let store = &t.state.store;
+            store
+                .commit(vec![
+                    gc_entry("expired", GC_EMPTY, 0),
+                    gc_entry("survivor", b"referenced", 100),
+                ])
+                .unwrap();
+            let control = gc_orphan(store, b"<html lang=\"control\"><body></body></html>");
+            let scan = after_snapshot.then(|| GcPause::at(&store.after_scan));
+            let queued = GcPause::at(&store.hooks.before_gc_wait);
+            std::thread::scope(|scope| {
+                let (start, start_rx) = mpsc::sync_channel(1);
+                let (done, done_rx) = mpsc::sync_channel(1);
+                let collector = scope.spawn(move || {
+                    start_rx.recv_timeout(GC_WAIT).unwrap();
+                    let result = gc_collect(store, purge);
+                    done.send(()).unwrap();
+                    result
+                });
+                if let Some(scan) = &scan {
+                    start.send(()).unwrap();
+                    scan.wait();
+                }
+                let write = GcPause::at(&store.hooks.before_commit);
+                let reused = if after_snapshot {
+                    GC_EMPTY
+                } else {
+                    b"live write"
+                };
+                let writer =
+                    scope.spawn(move || store.commit(vec![gc_entry("reused", reused, 100)]));
+                write.wait(); // No zero-writer gap is possible before admission queues.
+
+                let (stop, stop_rx) = mpsc::channel::<()>();
+                let (active, active_rx) = mpsc::sync_channel(1);
+                let (shed, shed_rx) = mpsc::sync_channel(1);
+                let traffic = scope.spawn(move || {
+                    let (mut committed, mut rejected) = (0, 0);
+                    loop {
+                        match stop_rx.recv_timeout(Duration::from_millis(1)) {
+                            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
+                        match store.commit(vec![gc_entry("traffic", b"ongoing traffic", 100)]) {
+                            Ok(1) => {
+                                committed += 1;
+                                let _ = active.try_send(());
+                            }
+                            Err(CommitError::Busy) => {
+                                rejected += 1;
+                                let _ = shed.try_send(());
+                            }
+                            result => panic!("unexpected traffic result: {result:?}"),
+                        }
+                    }
+                    (committed, rejected)
+                });
+                active_rx.recv_timeout(GC_WAIT).unwrap();
+                if after_snapshot {
+                    drop(scan);
+                } else {
+                    start.send(()).unwrap();
+                }
+                queued.wait();
+                shed_rx.recv_timeout(GC_WAIT).unwrap();
+                // Fair admission must close the gate before the writer drains.
+                assert!(matches!(
+                    store.commit(vec![gc_entry("must_retry", b"later", 100)]),
+                    Err(CommitError::Busy)
+                ));
+                drop(queued);
+                drop(write);
+                assert_eq!(writer.join().unwrap().unwrap(), 1);
+                done_rx
+                    .recv_timeout(GC_WAIT)
+                    .expect("collector starved under writes");
+                // Traffic is still running when collection finishes.
+                let result = collector.join().unwrap().unwrap();
+                drop(stop);
+                let (committed, rejected) = traffic.join().unwrap();
+                assert!(committed > 0 && rejected > 0);
+                assert_eq!(result, (1, if after_snapshot { 1 } else { 2 }));
+                gc_assert_body(store, "reused", reused);
+            });
+            assert!(!file_exists(store, &control));
+            assert!(store.db.get(b"res:expired").unwrap().is_none());
+            gc_assert_body(store, "survivor", b"referenced");
+            gc_assert_body(store, "traffic", b"ongoing traffic");
+        }
+    }
+}
+
+#[tokio::test]
+async fn gc_upload_shedding_is_retryable_during_pending_and_deleting_collection() {
+    for purge in [false, true] {
+        for pending in [false, true] {
+            let t = env();
+            let store = &t.state.store;
+            gc_orphan(store, GC_EMPTY);
+            let writer = if pending {
+                let pause = GcPause::at(&store.hooks.before_commit);
+                let st = store.clone();
+                let job = tokio::task::spawn_blocking(move || {
+                    st.commit(vec![gc_entry("inflight", b"live write", 100)])
+                });
+                pause.wait();
+                Some((pause, job))
+            } else {
+                None
+            };
+            let pause = GcPause::at(if pending {
+                &store.hooks.before_gc_wait
+            } else {
+                &store.hooks.before_delete
+            });
+            let st = store.clone();
+            let collector = tokio::task::spawn_blocking(move || gc_collect(&st, purge));
+            pause.wait();
+            for batch in [false, true] {
+                let p = payload(Some("gc"), "retry", "https://gc/retry", GC_EMPTY);
+                let (path, json) = if batch {
+                    ("/cache/index/batch", serde_json::to_vec(&vec![p]).unwrap())
+                } else {
+                    ("/cache/index", serde_json::to_vec(&p).unwrap())
+                };
+                let (status, headers, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    call(&t.state, post(path, None, json)),
+                )
+                .await
+                .unwrap();
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(headers["retry-after"], "1");
+                assert!(store.db.get(b"res:retry").unwrap().is_none());
+                assert!(store.db.get(b"site:gc::retry").unwrap().is_none());
+                assert!(store.get_cached("retry").is_none());
+            }
+            drop(pause);
+            if let Some((pause, job)) = writer {
+                drop(pause);
+                assert_eq!(job.await.unwrap().unwrap(), 1);
+            }
+            assert_eq!(collector.await.unwrap().unwrap(), (0, 1));
+            index_one(
+                &t.state,
+                &payload(Some("gc"), "retry", "https://gc/retry", GC_EMPTY),
+                None,
+            )
+            .await;
+            gc_assert_body(store, "retry", GC_EMPTY);
+
+            // Genuine storage failures keep their error classification.
+            store
+                .hooks
+                .fail_write
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let (status, headers, _) = call(
+                &t.state,
+                post(
+                    "/cache/index",
+                    None,
+                    serde_json::to_vec(&payload(
+                        Some("gc"),
+                        "failed",
+                        "https://gc/failed",
+                        b"failure",
+                    ))
+                    .unwrap(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!headers.contains_key("retry-after"));
+            assert!(store.db.get(b"res:failed").unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn cleanup_worker_retries_a_failed_full_sweep_on_its_next_pass() {
+    use std::time::Duration;
+    let t = env_with(|cfg| {
+        cfg.cleanup_interval = Duration::from_millis(20);
+        cfg.full_sweep_every = 10_000;
+    });
+    t.state
+        .store
+        .db
+        .put(b"file:legacy", b"unmarked orphan")
+        .unwrap();
+    t.state
+        .store
+        .hooks
+        .fail_write
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let pause = GcPause::at(&t.state.store.hooks.before_delete);
+    let worker = tokio::spawn(crate::run_cleanup_worker(t.state.clone()));
+    let pause = tokio::task::spawn_blocking(move || {
+        pause.wait();
+        pause
+    })
+    .await
+    .unwrap();
+    assert!(t.state.store.db.get(b"file:legacy").unwrap().is_some());
+    drop(pause); // First full sweep fails its batch; the next must still be full.
+    let result = tokio::time::timeout(GC_WAIT, async {
+        loop {
+            let store = t.state.store.clone();
+            if tokio::task::spawn_blocking(move || store.db.get(b"file:legacy").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    result.expect("failed full sweep was skipped until the next full-sweep cycle");
+}
+
+#[test]
+fn gc_refresh_during_scan_preserves_resource_and_durable_orphan_work() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        store
+            .commit(vec![gc_entry("refresh", GC_EMPTY, 0)])
+            .unwrap();
+        let old = compute_file_id(GC_EMPTY);
+        let pause = GcPause::at(&store.after_scan);
+        std::thread::scope(|scope| {
+            let gc = scope.spawn(|| gc_collect(store, purge));
+            pause.wait();
+            store
+                .commit(vec![gc_entry("refresh", b"fresh body", 100)])
+                .unwrap();
+            drop(pause);
+            assert_eq!(gc.join().unwrap().unwrap(), (0, 0));
+        });
+        gc_assert_body(store, "refresh", b"fresh body");
+        assert!(store.db.get(format!("orph:{old}")).unwrap().is_some());
+        assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 1);
+        assert!(!file_exists(store, &old));
+    }
+}
+
+#[test]
+fn gc_scan_does_not_settle_a_marker_recreated_by_an_overwrite() {
+    let t = env();
+    let store = &t.state.store;
+    store
+        .commit(vec![gc_entry("live", b"old live body", 100)])
+        .unwrap();
+    let old = compute_file_id(b"old live body");
+    store.db.put(format!("orph:{old}"), b"").unwrap();
+    let pause = GcPause::at(&store.after_scan);
+    std::thread::scope(|scope| {
+        let gc = scope.spawn(|| store.cleanup(10, 100, false));
+        pause.wait();
+        store
+            .commit(vec![gc_entry("live", b"new live body", 100)])
+            .unwrap();
+        drop(pause);
+        assert_eq!(gc.join().unwrap().unwrap().removed_files, 0);
+    });
+    assert!(store.db.get(format!("orph:{old}")).unwrap().is_some());
+    assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 1);
+    gc_assert_body(store, "live", b"new live body");
+}
+
+#[test]
+fn gc_io_failure_aborts_deletion_and_releases_all_admission() {
+    use std::sync::atomic::Ordering;
+    for purge in [false, true] {
+        for read_failure in [false, true] {
+            let t = env();
+            let store = &t.state.store;
+            store
+                .commit(vec![
+                    gc_entry("expired", GC_EMPTY, 0),
+                    gc_entry("survivor", b"referenced", 100),
+                ])
+                .unwrap();
+            let fail = if read_failure {
+                &store.hooks.fail_gc_read
+            } else {
+                &store.hooks.fail_write
+            };
+            fail.store(true, Ordering::Relaxed);
+            assert!(gc_collect(store, purge)
+                .unwrap_err()
+                .contains("injected I/O failure"));
+            assert!(store.db.get(b"site:gc::expired").unwrap().is_some());
+            assert!(store.get_cached("expired").is_some());
+            gc_assert_body(store, "expired", GC_EMPTY);
+            gc_assert_body(store, "survivor", b"referenced");
+            assert_eq!(gc_collect(store, purge).unwrap(), (1, 1));
+            assert!(store.db.get(b"res:expired").unwrap().is_none());
+            gc_assert_body(store, "survivor", b"referenced");
+        }
+    }
+}
+
+#[test]
+fn gc_failed_writer_neither_publishes_memory_nor_leaks_epoch_admission() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        let fid = gc_orphan(store, GC_EMPTY);
+        let pause = GcPause::at(&store.after_scan);
+        std::thread::scope(|scope| {
+            let gc = scope.spawn(|| gc_collect(store, purge));
+            pause.wait();
+            store
+                .hooks
+                .fail_write
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(store
+                .commit(vec![gc_entry("failed", GC_EMPTY, 100)])
+                .unwrap_err()
+                .to_string()
+                .contains("injected I/O failure"));
+            drop(pause);
+            assert_eq!(gc.join().unwrap().unwrap(), (0, 0));
+        });
+        assert!(store.get_cached("failed").is_none());
+        assert!(store.db.get(b"res:failed").unwrap().is_none());
+        assert!(file_exists(store, &fid));
+        assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 1);
+        assert!(!file_exists(store, &fid));
+    }
+}
+
+#[tokio::test]
+async fn gc_cancelled_waiter_cannot_release_a_running_scan_epoch() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        gc_orphan(store, GC_EMPTY);
+        let pause = GcPause::at(&store.after_scan);
+        let st = store.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let job = tokio::task::spawn_blocking(move || {
+            let result = gc_collect(&st, purge);
+            let _ = done_tx.send(result);
+        });
+        pause.wait();
+        let waiter = tokio::spawn(job);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(gc_collect(store, !purge)
+            .unwrap_err()
+            .contains("maintenance active"));
+        store
+            .commit(vec![gc_entry("reused", GC_EMPTY, 100)])
+            .unwrap();
+        drop(pause);
+        assert_eq!(
+            tokio::time::timeout(GC_WAIT, done_rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            (0, 0)
+        );
+        gc_assert_body(store, "reused", GC_EMPTY);
+        assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 0);
+    }
+}
+
+#[tokio::test]
+async fn gc_cancelled_writer_keeps_its_slot_through_the_database_commit() {
+    let t = env();
+    let store = &t.state.store;
+    gc_orphan(store, GC_EMPTY);
+    let pause = GcPause::at(&store.hooks.before_commit);
+    let st = store.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let job = tokio::task::spawn_blocking(move || {
+        let result = st.commit(vec![gc_entry("reused", GC_EMPTY, 100)]);
+        let _ = done_tx.send(result);
+    });
+    pause.wait();
+    let waiter = tokio::spawn(job);
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    for purge in [false, true] {
+        assert!(gc_collect(store, purge)
+            .unwrap_err()
+            .contains("writers active"));
+    }
+    drop(pause);
+    assert_eq!(
+        tokio::time::timeout(GC_WAIT, done_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.cleanup(10, 100, false).unwrap().removed_files, 0);
+    gc_assert_body(store, "reused", GC_EMPTY);
+}
+
+#[tokio::test]
+async fn gc_cancelled_requester_cannot_reopen_a_pending_collectors_gate() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        let orphan = gc_orphan(store, GC_EMPTY);
+        let write = GcPause::at(&store.hooks.before_commit);
+        let st = store.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            st.commit(vec![gc_entry("inflight", b"referenced", 100)])
+        });
+        write.wait();
+        let queued = GcPause::at(&store.hooks.before_gc_wait);
+        let st = store.clone();
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        let collector = tokio::task::spawn_blocking(move || {
+            let _ = done.send(gc_collect(&st, purge));
+        });
+        queued.wait();
+        let requester = tokio::spawn(collector);
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+        assert!(gc_collect(store, !purge)
+            .unwrap_err()
+            .contains("maintenance active"));
+        assert!(matches!(
+            store.commit(vec![gc_entry("retry", GC_EMPTY, 100)]),
+            Err(crate::store::CommitError::Busy)
+        ));
+        assert!(file_exists(store, &orphan));
+        drop(queued);
+        drop(write);
+        assert_eq!(writer.await.unwrap().unwrap(), 1);
+        assert_eq!(
+            tokio::time::timeout(GC_WAIT, done_rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            (0, 1)
+        );
+        gc_assert_body(store, "inflight", b"referenced");
+        store
+            .commit(vec![gc_entry("retry", GC_EMPTY, 100)])
+            .unwrap();
+        gc_assert_body(store, "retry", GC_EMPTY);
+    }
+}
+
+#[test]
+fn gc_dropping_an_unstarted_purge_releases_its_reservation() {
+    let t = env();
+    let store = &t.state.store;
+    let job = store.reserve_purge().unwrap();
+    assert!(store.reserve_purge().is_err());
+    assert!(store.cleanup(10, 100, true).is_err());
+    drop(job);
+    store.cleanup(10, 100, true).unwrap();
+    store.reserve_purge().unwrap()().unwrap();
+}
+
+#[test]
+fn gc_real_database_write_errors_preserve_references_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_tests(dir.path().join("db").to_str().unwrap());
+    {
+        let store = Store::open(&cfg).unwrap();
+        store
+            .commit(vec![
+                gc_entry("expired", GC_EMPTY, 0),
+                gc_entry("survivor", b"referenced", 100),
+            ])
+            .unwrap();
+        store.db.flush().unwrap();
+    }
+    {
+        let db = DB::open_for_read_only(&crate::store::db_options(&cfg), &cfg.rocksdb_path, false)
+            .unwrap();
+        let store = Store::with_db(Arc::new(db), &cfg);
+        // Real RocksDB failures, not only fault injection. Repeated calls
+        // must get an I/O error rather than an admission slot leaked by one.
+        for _ in 0..2 {
+            assert!(store
+                .commit(vec![gc_entry("failed", b"new", 100)])
+                .unwrap_err()
+                .to_string()
+                .contains("rocksdb batch write"));
+            for purge in [false, true] {
+                let error = gc_collect(&store, purge).unwrap_err();
+                assert!(error.contains("write"), "{error}");
+                assert!(!error.contains("busy"), "{error}");
+                gc_assert_body(&store, "expired", GC_EMPTY);
+                gc_assert_body(&store, "survivor", b"referenced");
+                assert!(store.db.get(b"site:gc::expired").unwrap().is_some());
+            }
+            assert!(store.get_cached("failed").is_none());
+            assert!(store.db.get(b"res:failed").unwrap().is_none());
+        }
+    }
+    {
+        let store = Store::open(&cfg).unwrap();
+        assert_eq!(gc_collect(&store, false).unwrap(), (1, 1));
+        store.db.flush().unwrap();
+    }
+    let store = Store::open(&cfg).unwrap();
+    assert!(store.db.get(b"res:expired").unwrap().is_none());
+    assert!(!file_exists(&store, &compute_file_id(GC_EMPTY)));
+    gc_assert_body(&store, "survivor", b"referenced");
+}
+
+#[test]
+fn gc_unreadable_rows_do_not_block_collection() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        store
+            .commit(vec![
+                gc_entry("expired", GC_EMPTY, 0),
+                gc_entry("survivor", b"referenced", 100),
+            ])
+            .unwrap();
+        let orphan = gc_orphan(store, b"<html lang=\"orphan\"><body></body></html>");
+        let bad_rows: &[(&[u8], &[u8])] = &[
+            (b"res:broken", b"{unreadable reference"),
+            (b"res:broken-schema", br#"{"file_id":123}"#),
+        ];
+        for &(key, value) in bad_rows {
+            store.db.put(key, value).unwrap();
+        }
+
+        assert_eq!(gc_collect(store, purge).unwrap(), (1, 2));
+        assert!(store.db.get(b"res:expired").unwrap().is_none());
+        assert!(store.db.get(b"site:gc::expired").unwrap().is_none());
+        assert!(!file_exists(store, &compute_file_id(GC_EMPTY)));
+        assert!(!file_exists(store, &orphan));
+        assert!(store.db.get(format!("orph:{orphan}")).unwrap().is_none());
+        gc_assert_body(store, "survivor", b"referenced");
+        for &(key, value) in bad_rows {
+            assert_eq!(store.db.get(key).unwrap().as_deref(), Some(value));
+        }
+
+        // The same unreadable rows must not stop subsequent passes either.
+        store
+            .commit(vec![gc_entry("expired_again", GC_EMPTY, 0)])
+            .unwrap();
+        assert_eq!(gc_collect(store, purge).unwrap(), (1, 1));
+        gc_assert_body(store, "survivor", b"referenced");
+    }
+}
+
+#[test]
+fn gc_unreadable_recheck_does_not_block_collection_or_lose_reused_body() {
+    for purge in [false, true] {
+        let t = env();
+        let store = &t.state.store;
+        store
+            .commit(vec![
+                gc_entry("a-broken", GC_EMPTY, 0),
+                gc_entry("z-expired", GC_EMPTY, 0),
+                gc_entry("survivor", b"referenced", 100),
+            ])
+            .unwrap();
+        let orphan = gc_orphan(store, b"<html lang=\"orphan\"><body></body></html>");
+        let scan = GcPause::at(&store.after_scan);
+        std::thread::scope(|scope| {
+            let gc = scope.spawn(|| gc_collect(store, purge));
+            scan.wait();
+            // Inject corruption after the snapshot selected this resource.
+            store
+                .db
+                .put(b"res:a-broken", b"{unreadable reference")
+                .unwrap();
+            store
+                .commit(vec![gc_entry("reused", GC_EMPTY, 100)])
+                .unwrap();
+            drop(scan);
+            assert_eq!(gc.join().unwrap().unwrap(), (1, 1));
+        });
+        assert_eq!(
+            store.db.get(b"res:a-broken").unwrap().as_deref(),
+            Some(b"{unreadable reference".as_slice())
+        );
+        assert!(store.db.get(b"res:z-expired").unwrap().is_none());
+        assert!(store.db.get(b"site:gc::z-expired").unwrap().is_none());
+        assert!(!file_exists(store, &orphan));
+        assert!(store.db.get(format!("orph:{orphan}")).unwrap().is_none());
+        gc_assert_body(store, "reused", GC_EMPTY);
+        gc_assert_body(store, "survivor", b"referenced");
+        assert!(store
+            .db
+            .get(format!("orph:{}", compute_file_id(GC_EMPTY)))
+            .unwrap()
+            .is_some());
+    }
+}
+
+#[tokio::test]
+async fn gc_purge_http_admission_is_bounded_before_spawning() {
+    let t = env();
+    let job = t.state.store.reserve_purge().unwrap();
+    let (status, headers, _) = call(&t.state, post("/cache/purge/empty", None, Vec::new())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
+    drop(job);
+    t.state.store.reserve_purge().unwrap()().unwrap();
+}
+
+#[tokio::test]
+async fn size_report_sheds_when_blocking_read_capacity_is_full() {
+    let t = env_with(|cfg| cfg.max_blocking_reads = 1);
+    let _slot = t.state.blocking_reads.clone().try_acquire_owned().unwrap();
+    let (status, headers, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        call(&t.state, get("/cache/size")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
+}
+
+#[test]
+fn startup_capacities_reject_zero_and_oversized_values_without_constructing_channels() {
+    use crate::config::MeiliConfig;
+    let good = Config::for_tests("unused");
+    good.validate().unwrap();
+    for value in [0, 1_000_001, usize::MAX] {
+        let mut cfg = good.clone();
+        cfg.max_connections = value;
+        assert!(cfg.validate().unwrap_err().contains("MAX_CONNECTIONS"));
+        cfg = good.clone();
+        cfg.max_blocking_reads = value;
+        assert!(cfg.validate().unwrap_err().contains("MAX_BLOCKING_READS"));
+        cfg = good.clone();
+        cfg.meili = Some(MeiliConfig {
+            host: "unused".into(),
+            key: "".into(),
+            index: "unused".into(),
+            queue_cap: value,
+            batch_max: 256,
+            flush_every: std::time::Duration::from_millis(200),
+        });
+        assert!(cfg.validate().unwrap_err().contains("MEILI_QUEUE_CAP"));
+    }
+    for value in [0, tokio::sync::Semaphore::MAX_PERMITS as u64 + 1, u64::MAX] {
+        let mut cfg = good.clone();
+        cfg.max_inflight_bytes = value;
+        assert!(cfg.validate().unwrap_err().contains("MAX_INFLIGHT_BYTES"));
+        cfg = good.clone();
+        cfg.max_inflight_small_bytes = value;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("MAX_INFLIGHT_SMALL_BYTES"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn incomplete_upload_deadline_releases_its_memory_budget() {
+    struct PendingBody;
+    impl http_body::Body for PendingBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+    let t = env_with(|cfg| cfg.upload_timeout = std::time::Duration::from_secs(2));
+    let before = t.state.budget.available_permits();
+    let small_before = t.state.small_budget.available_permits();
+    let response = handle(
+        Request::post("/cache/index").body(PendingBody).unwrap(),
+        t.state.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(t.state.budget.available_permits(), before);
+    assert_eq!(t.state.small_budget.available_permits(), small_before);
+}
+
 // ---------------------------------------------------------------- v0.2.3 compatibility
 
 /// Options exactly as v0.2.3 set them (main.rs 334-367 at bdf83f6).
@@ -1054,6 +1938,84 @@ fn write_v023_records(db: &DB, n: usize) -> Vec<(String, Vec<u8>)> {
     }
     db.flush().unwrap();
     out
+}
+
+#[test]
+fn gc_collectors_preserve_v023_references_and_persist_deletions() {
+    for purge in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache_db");
+        let orphan_body = b"<html lang=\"legacy-orphan\"><body></body></html>";
+        let orphan = compute_file_id(orphan_body);
+        let expected = {
+            let db = DB::open(&v023_options(), &path).unwrap();
+            let expected = write_v023_records(&db, 6);
+
+            // An older row can omit both optional fields. Its shared body
+            // must survive TTL expiry of the original reference.
+            let raw = db.get(format!("res:{}", expected[1].0)).unwrap().unwrap();
+            let mut alias: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let fields = alias.as_object_mut().unwrap();
+            fields.insert("resource_key".into(), "legacy-alias".into());
+            fields.remove("created_at");
+            fields.remove("http_version");
+            db.put(b"res:legacy-alias", serde_json::to_vec(&alias).unwrap())
+                .unwrap();
+            db.put(b"site:old.com::legacy-alias", b"").unwrap();
+            // v0.2.3 did not write orphan markers.
+            db.put(format!("file:{orphan}"), orphan_body).unwrap();
+            db.put(b"res:broken", b"{unreadable reference").unwrap();
+            db.flush().unwrap();
+            expected
+        };
+
+        let mut cfg = Config::for_tests(path.to_str().unwrap());
+        cfg.rocksdb_blob_files = true;
+        let collect = |store: &Store| {
+            if purge {
+                let result = store.purge_empty().unwrap();
+                (result.purged_resources, result.purged_files)
+            } else {
+                let result = store.cleanup(10, 1_700_000_012, true).unwrap();
+                (result.expired_resource_keys.len(), result.removed_files)
+            }
+        };
+        let removed = if purge { 1 } else { 2 };
+        {
+            let store = Store::open(&cfg).unwrap();
+            assert_eq!(collect(&store), (removed, 2));
+            gc_assert_body(&store, "legacy-alias", &expected[1].1);
+            store.db.flush().unwrap();
+        }
+
+        let store = Store::open(&cfg).unwrap();
+        for (i, (key, body)) in expected.iter().enumerate() {
+            if i < removed {
+                assert!(store.db.get(format!("res:{key}")).unwrap().is_none());
+                assert!(store
+                    .db
+                    .get(format!("site:old.com::{key}"))
+                    .unwrap()
+                    .is_none());
+            } else {
+                gc_assert_body(&store, key, body);
+            }
+        }
+        gc_assert_body(&store, "legacy-alias", &expected[1].1);
+        assert!(store
+            .db
+            .get(b"site:old.com::legacy-alias")
+            .unwrap()
+            .is_some());
+        assert!(!file_exists(&store, &compute_file_id(&expected[0].1)));
+        assert!(!file_exists(&store, &orphan));
+        assert!(store.db.get(format!("orph:{orphan}")).unwrap().is_none());
+        assert_eq!(
+            store.db.get(b"res:broken").unwrap().as_deref(),
+            Some(b"{unreadable reference".as_slice())
+        );
+        assert_eq!(collect(&store), (0, 0));
+    }
 }
 
 #[tokio::test]
